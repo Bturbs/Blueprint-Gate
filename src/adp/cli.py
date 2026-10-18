@@ -56,7 +56,11 @@ def _control_client(control_url: str, token_env: str, *, allow_container_control
     token = os.environ.get(token_env)
     if not token:
         raise typer.BadParameter(f"Set {token_env} in the environment")
-    return httpx.Client(base_url=origin, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    headers = {"Authorization": f"Bearer {token}"}
+    human_token = os.environ.get("ADP_HUMAN_GITHUB_TOKEN")
+    if human_token:
+        headers["X-Human-Authorization"] = f"Bearer {human_token}"
+    return httpx.Client(base_url=origin, headers=headers, timeout=timeout)
 
 
 def _control_path(repository_id: str | None) -> str:
