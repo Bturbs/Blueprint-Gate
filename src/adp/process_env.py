@@ -3,6 +3,9 @@
 import os
 import pwd
 import re
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -31,6 +34,51 @@ _GIT_PUSH = _GIT_LOCAL | {
     "GIT_ASKPASS", "SSH_ASKPASS", "DISPLAY",
 }
 _PROXIES = {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"}
+_VM_WORKSPACE = Path("/srv/blueprint-gate")
+
+
+@dataclass(frozen=True)
+class UntrustedSandbox:
+    """Filesystem view for one untrusted job inside the dedicated Linux VM."""
+
+    workdir: Path
+    writable: tuple[Path, ...] = ()
+    readonly: tuple[Path, ...] = ()
+    root: Path = _VM_WORKSPACE
+    network: bool = True
+
+
+def _sandbox_argv(argv: list[str], home: Path, sandbox: UntrustedSandbox) -> list[str]:
+    if not shutil.which("bwrap"):
+        raise ValueError("Filesystem confinement requires bubblewrap")
+    root = sandbox.root.resolve(strict=True)
+    if root != _VM_WORKSPACE or not root.is_dir():
+        raise ValueError("Filesystem confinement requires the trusted VM workspace")
+    workdir = sandbox.workdir.resolve(strict=True)
+    writable = tuple(path.resolve(strict=True) for path in sandbox.writable)
+    readonly = tuple(path.resolve(strict=True) for path in sandbox.readonly)
+    for path in (*writable, *readonly):
+        if not path.is_relative_to(root) or path == root:
+            raise ValueError("Sandbox path escapes the trusted VM workspace")
+    if workdir not in writable and workdir not in readonly:
+        raise ValueError("Sandbox workdir is not an allowed path")
+    if any(left == right or left.is_relative_to(right) or right.is_relative_to(left)
+           for left in writable for right in readonly):
+        raise ValueError("Sandbox writable and read-only paths overlap")
+    command = [
+        "bwrap", "--ro-bind", "/", "/", "--tmpfs", "/home",
+        "--bind", str(home), str(home),
+        "--tmpfs", str(root), "--tmpfs", "/tmp", "--proc", "/proc",
+        "--dev", "/dev", "--unshare-pid", "--die-with-parent",
+    ]
+    if not sandbox.network:
+        command.append("--unshare-net")
+    for path in readonly:
+        command.extend(("--ro-bind", str(path), str(path)))
+    for path in writable:
+        command.extend(("--bind", str(path), str(path)))
+    command.extend(("--chdir", str(workdir), "--", *argv))
+    return command
 
 
 def child_environment(purpose: str, provider: str | None = None) -> dict[str, str]:
@@ -61,7 +109,8 @@ def child_environment(purpose: str, provider: str | None = None) -> dict[str, st
     return selected
 
 
-def untrusted_argv(argv: list[str], username: str, purpose: str, provider: str | None = None) -> tuple[list[str], dict[str, str]]:
+def untrusted_argv(argv: list[str], username: str, purpose: str, provider: str | None = None,
+                   sandbox: UntrustedSandbox | None = None) -> tuple[list[str], dict[str, str]]:
     """Run checkout-driven tools as a separate Unix identity, with a fresh env.
 
     The worker account holds its claim and delivery credentials. The agent
@@ -80,4 +129,7 @@ def untrusted_argv(argv: list[str], username: str, purpose: str, provider: str |
         allowed["CODEX_HOME"] = f"{account.pw_dir}/.codex"
     elif provider == "claude":
         allowed["CLAUDE_CONFIG_DIR"] = f"{account.pw_dir}/.claude"
-    return ["sudo", "-n", "-u", username, "--", "env", "-i", *(f"{key}={value}" for key, value in allowed.items()), "sh", "-c", 'umask 002; exec "$@"', "sh", *argv], child_environment("check")
+    if sandbox:
+        allowed["GIT_OPTIONAL_LOCKS"] = "0"
+    command = _sandbox_argv(argv, Path(account.pw_dir), sandbox) if sandbox else argv
+    return ["sudo", "-n", "-u", username, "--", "env", "-i", *(f"{key}={value}" for key, value in allowed.items()), "sh", "-c", 'umask 002; exec "$@"', "sh", *command], child_environment("check")

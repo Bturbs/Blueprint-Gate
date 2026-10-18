@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from adp import worker
-from adp.process_env import child_environment, untrusted_argv
+from adp import process_env, worker
+from adp.process_env import UntrustedSandbox, child_environment, untrusted_argv
 from adp.runtimes import _run, runtime_identity
 
 
@@ -228,6 +228,31 @@ def test_untrusted_identity_gets_only_its_provider_home(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="distinct non-root"):
         monkeypatch.setattr("adp.process_env.os.getuid", lambda: 10001)
         untrusted_argv(["codex"], "blueprint-agent", "runtime", "codex")
+
+
+def test_untrusted_sandbox_masks_other_worktrees_and_rejects_broad_mounts(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    active = workspace / "worktrees" / "issue-1"
+    other = workspace / "worktrees" / "issue-2"
+    metadata = workspace / "repos" / "project" / ".git"
+    home = tmp_path / "agent-home"
+    for path in (active, other, metadata, home):
+        path.mkdir(parents=True)
+    monkeypatch.setattr(process_env, "_VM_WORKSPACE", workspace)
+    monkeypatch.setattr(process_env.shutil, "which", lambda executable: "/usr/bin/bwrap")
+    sandbox = UntrustedSandbox(workdir=active, writable=(active,), readonly=(metadata,), root=workspace, network=False)
+    argv = process_env._sandbox_argv(["git", "status"], home, sandbox)
+    assert argv[:8] == ["bwrap", "--ro-bind", "/", "/", "--tmpfs", "/home", "--bind", str(home)]
+    assert ["--tmpfs", str(workspace)] == argv[argv.index(str(workspace)) - 1:argv.index(str(workspace)) + 1]
+    assert ["--bind", str(active), str(active)] == argv[argv.index(str(active)) - 1:argv.index(str(active)) + 2]
+    assert ["--ro-bind", str(metadata), str(metadata)] == argv[argv.index(str(metadata)) - 1:argv.index(str(metadata)) + 2]
+    assert str(other) not in argv and "--unshare-net" in argv
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(ValueError, match="escapes"):
+        process_env._sandbox_argv(["true"], home, UntrustedSandbox(workdir=outside, writable=(outside,), root=workspace))
+    with pytest.raises(ValueError, match="overlap"):
+        process_env._sandbox_argv(["true"], home, UntrustedSandbox(workdir=active, writable=(active,), readonly=(active,), root=workspace))
 
 
 @pytest.mark.asyncio

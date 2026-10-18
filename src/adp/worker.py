@@ -6,6 +6,7 @@ import fcntl
 import grp
 import os
 import signal
+import shutil
 import ssl
 import sys
 from contextlib import nullcontext
@@ -21,7 +22,7 @@ import httpx
 import yaml
 
 from adp.runtimes import _run, candidate_runtimes, runtime_identity
-from adp.process_env import child_environment, untrusted_argv
+from adp.process_env import UntrustedSandbox, child_environment, untrusted_argv
 from adp.publication import attempt_branch
 from adp.control_url import control_origin
 from adp.threat_models import committed_model_revision, in_place_controls, model_revision, reject_unverified_controls, verify
@@ -45,6 +46,21 @@ def _git(cwd: Path, *args: str) -> str:
     purpose = "git_push" if args and args[0] == "push" else "git_local"
     result = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=cwd, text=True, capture_output=True, check=True, timeout=120, env=child_environment(purpose))
     return result.stdout.strip()
+
+
+def _agent_sandbox(cwd: Path, app_cwd: Path) -> UntrustedSandbox:
+    """Expose only this ticket's worktrees and their read-only Git metadata."""
+    readonly = []
+    for worktree_path in {cwd, app_cwd}:
+        git_dir = Path(_git(worktree_path, "rev-parse", "--git-common-dir"))
+        readonly.append((worktree_path / git_dir).resolve() if not git_dir.is_absolute() else git_dir.resolve())
+    if app_cwd != cwd:
+        readonly.append(app_cwd)
+    return UntrustedSandbox(workdir=cwd, writable=(cwd,), readonly=tuple(dict.fromkeys(readonly)))
+
+
+def _verifier_sandbox(cwd: Path, tool_root: Path) -> UntrustedSandbox:
+    return UntrustedSandbox(workdir=tool_root, readonly=(tool_root, cwd), network=False)
 
 
 async def _remote_cli(cwd: Path, argv: list[str], guard: Callable[[], Awaitable[None]] | None) -> str:
@@ -444,7 +460,8 @@ async def _execute_job_inner(job: dict, config: dict, guard: Callable[[], Awaita
     chosen = None
     candidates = candidate_runtimes(policy, stage)
     untrusted_user = config.get("untrusted_user")
-    with runtime_identity(untrusted_user) if untrusted_user else nullcontext():
+    sandbox = _agent_sandbox(cwd, app_cwd) if config.get("untrusted_sandbox") else None
+    with runtime_identity(untrusted_user, sandbox=sandbox) if untrusted_user else nullcontext():
         for runtime in candidates:
             status = await runtime.validate_environment()
             if not status.get("available"):
@@ -474,7 +491,9 @@ async def _execute_job_inner(job: dict, config: dict, guard: Callable[[], Awaita
             raise ValueError("Threat model path escapes worktree")
         after_controls = in_place_controls(root.parent)
         reject_unverified_controls(before_controls, after_controls)
-        verification = await verify(root, Path(tool_path).expanduser(), untrusted_user=untrusted_user)
+        tool_root = Path(tool_path).expanduser()
+        verification = await verify(root, tool_root, untrusted_user=untrusted_user,
+                                    sandbox=_verifier_sandbox(cwd, tool_root) if config.get("untrusted_sandbox") else None)
         result["verification"] = verification
         result["verification_passed"] = verification["passed"]
         result["threat_revision"] = verification.get("revision")
@@ -523,7 +542,9 @@ async def _execute_job_inner(job: dict, config: dict, guard: Callable[[], Awaita
             model_root = (app_cwd / local["threat_root_model"]).resolve()
             if not model_root.is_relative_to(app_cwd):
                 raise ValueError("Threat model path escapes worktree")
-            model_result = await verify(model_root, Path(config["threat_tool_root"]).expanduser(), untrusted_user=untrusted_user)
+            tool_root = Path(config["threat_tool_root"]).expanduser()
+            model_result = await verify(model_root, tool_root, untrusted_user=untrusted_user,
+                                        sandbox=_verifier_sandbox(app_cwd, tool_root) if config.get("untrusted_sandbox") else None)
             result["model_consistency"] = model_result
             if not model_result["passed"] or model_result["revision"] != job["ticket"].get("threat_revision"):
                 raise ValueError("Implementation changed or invalidated the approved threat model")
@@ -590,6 +611,8 @@ def _assert_isolated_worker(config: dict) -> None:
     if not isinstance(group_name, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", group_name):
         raise ValueError("Configure a shared untrusted_group for issue worktrees")
     grp.getgrnam(group_name)
+    if config.get("untrusted_sandbox") and not shutil.which("bwrap"):
+        raise ValueError("Worker filesystem confinement requires bubblewrap")
     argv, env = untrusted_argv(["true"], username, "verify")
     result = subprocess.run(argv, env=env, capture_output=True, timeout=5)
     if result.returncode:

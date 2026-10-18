@@ -10,18 +10,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from adp.process_env import child_environment, untrusted_argv
+from adp.process_env import UntrustedSandbox, child_environment, untrusted_argv
 
 
 _runtime_user: ContextVar[str | None] = ContextVar("runtime_user", default=None)
+_runtime_sandbox: ContextVar[UntrustedSandbox | None] = ContextVar("runtime_sandbox", default=None)
 
 
 @contextmanager
-def runtime_identity(username: str):
+def runtime_identity(username: str, sandbox: UntrustedSandbox | None = None):
     token = _runtime_user.set(username)
+    sandbox_token = _runtime_sandbox.set(sandbox)
     try:
         yield
     finally:
+        _runtime_sandbox.reset(sandbox_token)
         _runtime_user.reset(token)
 
 
@@ -63,7 +66,11 @@ async def _terminate_group(process: asyncio.subprocess.Process) -> None:
 
 async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     if env is None and _runtime_user.get():
-        argv, env = untrusted_argv(argv, _runtime_user.get(), "runtime", Path(argv[0]).name)
+        sandbox = _runtime_sandbox.get()
+        if sandbox:
+            argv, env = untrusted_argv(argv, _runtime_user.get(), "runtime", Path(argv[0]).name, sandbox=sandbox)
+        else:
+            argv, env = untrusted_argv(argv, _runtime_user.get(), "runtime", Path(argv[0]).name)
     process = await asyncio.create_subprocess_exec(
         *argv, cwd=cwd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

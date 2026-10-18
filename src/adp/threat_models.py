@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 import yaml
 
-from adp.process_env import child_environment, untrusted_argv
+from adp.process_env import UntrustedSandbox, child_environment, untrusted_argv
 
 
 def discover(root: Path) -> list[Path]:
@@ -72,7 +72,8 @@ def committed_model_revision(repository: Path, model_directory: Path, commit_sha
     return digest.hexdigest()
 
 
-async def verify(root_model: Path, tool_root: Path, timeout: int = 120, untrusted_user: str | None = None) -> dict:
+async def verify(root_model: Path, tool_root: Path, timeout: int = 120, untrusted_user: str | None = None,
+                 sandbox: UntrustedSandbox | None = None) -> dict:
     if not root_model.is_file():
         return {"passed": False, "error": "Root model not found"}
     script = tool_root / "src/scripts/verify-threat-model.ts"
@@ -81,7 +82,10 @@ async def verify(root_model: Path, tool_root: Path, timeout: int = 120, untruste
     argv = ["npx", "--no-install", "tsx", str(script), str(root_model.resolve())]
     env = child_environment("verify")
     if untrusted_user:
-        argv, env = untrusted_argv(argv, untrusted_user, "verify")
+        if sandbox:
+            argv, env = untrusted_argv(argv, untrusted_user, "verify", sandbox=sandbox)
+        else:
+            argv, env = untrusted_argv(argv, untrusted_user, "verify")
     process = await asyncio.create_subprocess_exec(
         *argv,
         cwd=tool_root, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

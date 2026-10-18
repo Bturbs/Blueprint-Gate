@@ -5,6 +5,9 @@ worker_token_env: ADP_WORKER_TOKEN
 worker_id: my-laptop
 untrusted_user: blueprint-agent
 untrusted_group: blueprint-work
+# In the dedicated VM, require Bubblewrap filesystem confinement for provider
+# CLIs and the model verifier. The bootstrap script enables this by default.
+# untrusted_sandbox: true
 capabilities: [git, codex]
 poll_seconds: 5
 threat_tool_root: /absolute/path/to/threat-model-tool
