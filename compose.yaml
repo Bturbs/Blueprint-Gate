@@ -46,6 +46,6 @@ services:
     depends_on:
       control:
         condition: service_healthy
-    command: ["sh", "-c", "adp scheduler http://control:8000 \"$$CONTROL_TOKEN\" --interval 60"]
+    command: ["adp", "scheduler", "http://control:8000", "--interval", "60"]
 volumes:
   postgres_data:
