@@ -6,7 +6,8 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from adp.db import Approval, AuditEvent, Repository, Ticket
+from adp.db import Approval, AuditEvent, PublicationAttempt, Repository, Ticket
+from adp.github import GitHubClient
 from adp.settings import settings
 from adp.github_auth import tokens
 from adp.workflow import dependencies_ready, security_gate
@@ -58,7 +59,7 @@ def eligibility(db: Session, ticket: Ticket, pr: dict, checks: list[dict], paths
 
 class GitHubMergeClient:
     def __init__(self, token: str | None = None, transport=None):
-        self.token = settings.github_token if token is None else token
+        self.token = token
         self.transport = transport
 
     async def _get_pages(self, client, path):
@@ -77,7 +78,7 @@ class GitHubMergeClient:
     async def reconcile(self, db: Session, ticket: Ticket) -> dict:
         if not ticket.pr_number:
             return {"merged": False, "reasons": ["PR missing"]}
-        token = self.token or await tokens.get()
+        token = await tokens.get(self.token)
         repo = ticket.repository.full_name
         number = ticket.pr_number
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10"}
@@ -119,6 +120,15 @@ class GitHubMergeClient:
             if pr.get("changed_files", len(paths)) > len(paths):
                 return {"merged": False, "reasons": ["PR changed-file list is incomplete"]}
             reasons = eligibility(db, ticket, pr, checks, paths)
+            retired = db.scalars(select(PublicationAttempt).where(PublicationAttempt.ticket_id == ticket.id, PublicationAttempt.state.in_(["RECONCILED", "LATE_EFFECT"]))).all()
+            for attempt in retired:
+                if attempt.state == "LATE_EFFECT":
+                    reasons.append("Late publication effect requires operator review")
+                    continue
+                try:
+                    await GitHubClient(token=token, transport=self.transport).publication_clear(attempt.repository, attempt.branch)
+                except Exception:
+                    reasons.append("Retired publication attempt is not confirmed clear")
             if reasons:
                 return {"merged": False, "reasons": reasons}
             response = await client.put(f"/repos/{repo}/pulls/{number}/merge-async", json={"sha": sha, "merge_method": ticket.repository.policy.get("merge_method", "squash"), "merge_action": "default"})

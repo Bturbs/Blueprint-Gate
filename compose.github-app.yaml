@@ -1,0 +1,13 @@
+# Use with compose.yaml when the control API uses a GitHub App.
+# The key exists only in the control container and is never copied to workers.
+services:
+  control:
+    environment:
+      HYBRID_MODE: "true"
+      GITHUB_TOKEN: ""
+      GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
+    volumes:
+      - type: bind
+        source: ${GITHUB_APP_PRIVATE_KEY_FILE:?set GITHUB_APP_PRIVATE_KEY_FILE to the host PEM path}
+        target: /run/secrets/github-app.pem
+        read_only: true

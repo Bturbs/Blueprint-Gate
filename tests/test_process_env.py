@@ -1,0 +1,287 @@
+import json
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from adp import process_env, worker
+from adp.process_env import UntrustedSandbox, child_environment, untrusted_argv
+from adp.runtimes import _run, runtime_identity
+
+
+_ENV_PROBE = """import json, os
+print(json.dumps({name: os.environ.get(name) for name in (
+    'PATH', 'HOME', 'CONTROL_TOKEN', 'ADP_WORKER_TOKEN',
+    'GH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'UNRELATED_SECRET'
+)}))
+"""
+
+
+@pytest.mark.asyncio
+async def test_agent_and_repository_checks_do_not_inherit_service_secrets(tmp_path, monkeypatch):
+    for name in ("CONTROL_TOKEN", "ADP_WORKER_TOKEN", "GH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "UNRELATED_SECRET"):
+        monkeypatch.setenv(name, f"secret-for-{name}")
+    argv = [sys.executable, "-c", _ENV_PROBE]
+
+    rc, out, err = await _run(argv, "", tmp_path, 10)
+    assert (rc, err) == (0, "")
+    runtime_env = json.loads(out)
+    check_env = child_environment("check")
+    for child_env in (runtime_env, check_env):
+        assert child_env["PATH"] and child_env["HOME"]
+        assert all(child_env.get(name) is None for name in (
+            "CONTROL_TOKEN", "ADP_WORKER_TOKEN", "GH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN", "UNRELATED_SECRET",
+        ))
+
+
+def test_repository_checks_require_a_pinned_isolated_image(tmp_path):
+    image = "example/checks@sha256:" + "a" * 64
+    command = [sys.executable, "-c", "print('ok')"]
+    argv = worker._check_argv(tmp_path, command, image, "blueprint-check-test")
+    assert argv[:2] == ["docker", "run"]
+    assert argv[argv.index("--network") + 1] == "none"
+    assert argv[argv.index("--cap-drop") + 1] == "ALL"
+    assert argv[argv.index("--user") + 1] == "65534:65534"
+    assert argv[argv.index("--mount") + 1].endswith(",dst=/workspace,readonly")
+    assert argv[argv.index("--entrypoint") + 1] == sys.executable
+    assert argv[-3:] == [image, "-c", "print('ok')"]
+    assert worker._check_argv(tmp_path, command, "sha256:" + "b" * 64, "blueprint-check-test")[-3:] == ["sha256:" + "b" * 64, "-c", "print('ok')"]
+    unsafe = tmp_path / "checkout,readonly=false"
+    unsafe.mkdir()
+    with pytest.raises(ValueError, match="Docker mount"):
+        worker._check_argv(unsafe, command, image, "blueprint-check-test")
+
+
+@pytest.mark.asyncio
+async def test_repository_checks_fail_closed_without_a_pinned_image(tmp_path):
+    with pytest.raises(ValueError, match="check_image"):
+        await worker._checks(tmp_path, [["python", "-m", "pytest"]])
+    with pytest.raises(ValueError, match="check_image"):
+        await worker._checks(tmp_path, [["python", "-m", "pytest"]], "python:3.12-slim")
+
+
+
+@pytest.mark.asyncio
+async def test_git_delivery_keeps_its_credential_but_not_worker_or_admin_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_TOKEN", "admin-secret")
+    monkeypatch.setenv("ADP_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setenv("GH_TOKEN", "github-secret")
+    monkeypatch.setenv("UNRELATED_SECRET", "unrelated-secret")
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append((argv[0], kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, "ok")
+
+    async def fake_remote_run(argv, prompt, cwd, timeout, env=None):
+        seen.append((argv[0], env))
+        if argv[0] == "git":
+            assert argv[1:3] == ["-c", "core.hooksPath=/dev/null"]
+        return 0, "ok", ""
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    monkeypatch.setattr(worker, "_run", fake_remote_run)
+    assert worker._git(tmp_path, "status") == "ok"
+    assert await worker._remote_cli(tmp_path, ["git", "push", "origin", "test"], None) == "ok"
+    assert await worker._remote_cli(tmp_path, ["gh", "auth", "status"], None) == "ok"
+    for (name, child_env), expect_github_token in zip(seen, (False, False, True)):
+        assert name in {"git", "gh"}
+        assert child_env.get("GH_TOKEN") == ("github-secret" if expect_github_token else None)
+        assert "CONTROL_TOKEN" not in child_env
+        assert "ADP_WORKER_TOKEN" not in child_env
+        assert "UNRELATED_SECRET" not in child_env
+
+
+def test_worker_git_ignores_repository_hooks(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    marker = tmp_path / "hook-ran"
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf '%s' \"$GH_TOKEN\" > '{marker}'\n")
+    hook.chmod(0o755)
+    subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", str(hooks)], check=True)
+    monkeypatch.setenv("GH_TOKEN", "github-secret")
+    (repo / "README.md").write_text("work")
+    worker._git(repo, "add", "README.md")
+    worker._git(repo, "commit", "-m", "work")
+    assert not marker.exists()
+
+
+def test_git_local_preserves_configured_author_identity(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    git_config = tmp_path / "gitconfig"
+    git_config.write_text("[user]\n name = Configured User\n email = configured@example.com\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(git_config))
+    (repo / "README.md").write_text("work")
+    worker._git(repo, "add", "README.md")
+    worker._git(repo, "commit", "-m", "work")
+    assert worker._git(repo, "show", "-s", "--format=%an <%ae>") == "Configured User <configured@example.com>"
+
+
+def test_git_push_does_not_pass_github_api_token_to_ssh_command(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README.md").write_text("work")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "work"], check=True)
+    marker = tmp_path / "ssh-env"
+    ssh = tmp_path / "fake-ssh"
+    ssh.write_text(f"#!/bin/sh\nprintf '%s' \"${{GH_TOKEN:-}}\" > '{marker}'\nexit 1\n")
+    ssh.chmod(0o755)
+    subprocess.run(["git", "-C", str(repo), "config", "core.sshCommand", str(ssh)], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "ssh://example.invalid/repo"], check=True)
+    monkeypatch.setenv("GH_TOKEN", "github-secret")
+    with pytest.raises(subprocess.CalledProcessError):
+        worker._git(repo, "push", "origin", "HEAD")
+    assert marker.read_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_direct_worker_launch_removes_service_tokens_before_claim(tmp_path, monkeypatch):
+    config = tmp_path / "worker.yaml"
+    config.write_text("control_url: http://127.0.0.1:8000\nworker_token_env: ADP_WORKER_TOKEN\n")
+    monkeypatch.setenv("CONTROL_TOKEN", "admin-secret")
+    monkeypatch.setenv("ADP_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setattr(worker, "_assert_isolated_worker", lambda config: None)
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs["headers"] == {"Authorization": "Bearer worker-secret"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            assert "CONTROL_TOKEN" not in os.environ
+            assert "ADP_WORKER_TOKEN" not in os.environ
+            return self
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return None
+
+    monkeypatch.setattr(worker.httpx, "AsyncClient", FakeClient)
+    await worker.run_worker(config, once=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_worker_rejects_admin_token_reused_as_worker_token(tmp_path, monkeypatch):
+    config = tmp_path / "worker.yaml"
+    config.write_text("control_url: http://127.0.0.1:8000\nworker_token_env: ADP_WORKER_TOKEN\n")
+    monkeypatch.setenv("CONTROL_TOKEN", "same-secret")
+    monkeypatch.setenv("ADP_WORKER_TOKEN", "same-secret")
+    with pytest.raises(ValueError, match="must be different"):
+        await worker.run_worker(config, once=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_worker_rejects_inline_token(tmp_path):
+    config = tmp_path / "worker.yaml"
+    config.write_text("control_url: http://127.0.0.1:8000\nworker_token: file-secret\n")
+    with pytest.raises(ValueError, match="worker_token_env"):
+        await worker.run_worker(config, once=True)
+
+
+def test_authenticated_proxy_credentials_are_not_inherited_by_untrusted_commands(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "https://person:proxy-secret@proxy.example:8443")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
+    env = child_environment("check")
+    assert "HTTPS_PROXY" not in env
+    assert env["HTTP_PROXY"] == "http://proxy.example:8080"
+
+
+def test_untrusted_identity_gets_only_its_provider_home(tmp_path, monkeypatch):
+    monkeypatch.setattr("adp.process_env.pwd.getpwnam", lambda name: SimpleNamespace(pw_uid=10001, pw_dir="/home/blueprint-agent"))
+    monkeypatch.setattr("adp.process_env.os.getuid", lambda: 501)
+    monkeypatch.setenv("HOME", "/home/supervisor")
+    monkeypatch.setenv("CODEX_HOME", "/home/supervisor/.codex")
+    monkeypatch.setenv("GH_TOKEN", "delivery-secret")
+    monkeypatch.setenv("ADP_WORKER_TOKEN", "claim-secret")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "other-provider-secret")
+    argv, outer_env = untrusted_argv(["codex", "exec"], "blueprint-agent", "runtime", "codex")
+    assert argv[:7] == ["sudo", "-n", "-u", "blueprint-agent", "--", "env", "-i"]
+    assert "HOME=/home/blueprint-agent" in argv
+    assert "CODEX_HOME=/home/blueprint-agent/.codex" in argv
+    assert not any("secret" in value or "/home/supervisor" in value for value in argv)
+    assert "GH_TOKEN" not in outer_env and "ADP_WORKER_TOKEN" not in outer_env
+    with pytest.raises(ValueError, match="distinct non-root"):
+        monkeypatch.setattr("adp.process_env.os.getuid", lambda: 10001)
+        untrusted_argv(["codex"], "blueprint-agent", "runtime", "codex")
+
+
+def test_untrusted_sandbox_masks_other_worktrees_and_rejects_broad_mounts(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    active = workspace / "worktrees" / "issue-1"
+    other = workspace / "worktrees" / "issue-2"
+    metadata = workspace / "repos" / "project" / ".git"
+    home = tmp_path / "agent-home"
+    for path in (active, other, metadata, home):
+        path.mkdir(parents=True)
+    monkeypatch.setattr(process_env, "_VM_WORKSPACE", workspace)
+    monkeypatch.setattr(process_env.shutil, "which", lambda executable: "/usr/bin/bwrap")
+    sandbox = UntrustedSandbox(workdir=active, writable=(active,), readonly=(metadata,), root=workspace, network=False)
+    argv = process_env._sandbox_argv(["git", "status"], home, sandbox)
+    assert argv[:8] == ["bwrap", "--ro-bind", "/", "/", "--tmpfs", "/home", "--bind", str(home)]
+    assert ["--tmpfs", str(workspace)] == argv[argv.index(str(workspace)) - 1:argv.index(str(workspace)) + 1]
+    assert ["--bind", str(active), str(active)] == argv[argv.index(str(active)) - 1:argv.index(str(active)) + 2]
+    assert ["--ro-bind", str(metadata), str(metadata)] == argv[argv.index(str(metadata)) - 1:argv.index(str(metadata)) + 2]
+    assert str(other) not in argv and "--unshare-net" in argv
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(ValueError, match="escapes"):
+        process_env._sandbox_argv(["true"], home, UntrustedSandbox(workdir=outside, writable=(outside,), root=workspace))
+    with pytest.raises(ValueError, match="overlap"):
+        process_env._sandbox_argv(["true"], home, UntrustedSandbox(workdir=active, writable=(active,), readonly=(active,), root=workspace))
+
+
+@pytest.mark.asyncio
+async def test_runtime_identity_wraps_provider_invocations(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_identity(argv, username, purpose, provider):
+        seen.append((argv, username, purpose, provider))
+        return ["identity-wrapper", *argv], {"PATH": os.environ["PATH"]}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _input):
+            return b"ok", b""
+
+    async def fake_spawn(*argv, **kwargs):
+        seen.append((argv, kwargs["env"]))
+        return FakeProcess()
+
+    monkeypatch.setattr("adp.runtimes.untrusted_argv", fake_identity)
+    monkeypatch.setattr("adp.runtimes.asyncio.create_subprocess_exec", fake_spawn)
+    with runtime_identity("blueprint-agent"):
+        assert await _run(["codex", "login", "status"], "", tmp_path, 10) == (0, "ok", "")
+    assert seen[0][1:] == ("blueprint-agent", "runtime", "codex")
+    assert seen[1][0][0] == "identity-wrapper"
+
+
+def test_host_worker_cannot_claim_jobs():
+    if sys.platform != "linux":
+        with pytest.raises(ValueError, match="dedicated Linux VM"):
+            worker._assert_isolated_worker({"untrusted_user": "blueprint-agent"})

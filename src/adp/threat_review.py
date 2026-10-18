@@ -11,7 +11,7 @@ class ThreatReviewClient:
         self.transport = transport
 
     async def review_state(self, artifact: dict) -> dict:
-        token = self.token or await tokens.get()
+        token = await tokens.get(self.token)
         repository = artifact["repository"]
         number = artifact["number"]
         expected = artifact["head_sha"]

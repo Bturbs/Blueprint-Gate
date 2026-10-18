@@ -1,10 +1,26 @@
 from fastapi.testclient import TestClient
+from datetime import timedelta
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from adp import api
-from adp.db import Base, Job, Repository, Ticket
+from adp.db import Base, Job, Repository, Ticket, now
+
+
+def worker_auth(client, worker_id):
+    response = client.post("/workers/credentials", headers={"Authorization": "Bearer admin"}, json={"worker_id": worker_id, "repositories": ["example/project"], "capabilities": ["git"], "expires_at": (now() + timedelta(days=7)).isoformat()})
+    response.raise_for_status()
+    return {"Authorization": f"Bearer {response.json()['token']}"}
+
+
+def test_equal_admin_and_worker_tokens_fail_closed(monkeypatch):
+    monkeypatch.setattr(api.settings, "control_token", "same-secret")
+    monkeypatch.setattr(api.settings, "worker_token", "same-secret")
+    with TestClient(api.app) as client:
+        admin = {"Authorization": "Bearer same-secret"}
+        assert client.post("/repositories", headers=admin, json={"full_name": "example/project"}).status_code == 503
+        assert client.post("/jobs/claim", headers=admin, json={"worker_id": "w1"}).status_code == 503
 
 
 def test_poll_claim_and_worker_cannot_approve(monkeypatch):
@@ -25,9 +41,9 @@ def test_poll_claim_and_worker_cannot_approve(monkeypatch):
     try:
         with TestClient(api.app) as client:
             admin = {"Authorization": "Bearer admin"}
-            worker = {"Authorization": "Bearer worker"}
             response = client.post("/repositories", headers=admin, json={"full_name": "example/project"})
             assert response.status_code == 200
+            worker = worker_auth(client, "w1")
             repo_id = response.json()["id"]
             assert client.post(f"/repositories/{repo_id}/poll", headers=admin).json() == {"discovered": 1, "created": 1, "replanned": 0}
             assert client.post(f"/repositories/{repo_id}/poll", headers=admin).json() == {"discovered": 1, "created": 0, "replanned": 0}
@@ -67,8 +83,8 @@ def test_issue_edit_invalidates_running_job(monkeypatch):
     try:
         with TestClient(api.app) as client:
             admin = {"Authorization": "Bearer admin"}
-            worker = {"Authorization": "Bearer worker"}
             repo_id = client.post("/repositories", headers=admin, json={"full_name": "example/project"}).json()["id"]
+            worker = worker_auth(client, "w")
             client.post(f"/repositories/{repo_id}/poll", headers=admin).raise_for_status()
             claim = client.post("/jobs/claim", headers=worker, json={"worker_id": "w"}).json()
             issue["body"] = "revised acceptance criteria"
@@ -78,5 +94,35 @@ def test_issue_edit_invalidates_running_job(monkeypatch):
             ticket = client.get(f"/tickets/{claim['ticket']['id']}", headers=admin).json()
             assert ticket["state"] == "NEEDS_REPLAN"
             assert ticket["jobs"][-1]["state"] == "QUEUED"
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_merge_reconciliation_reports_github_configuration_error_per_ticket(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+
+    def get_db():
+        with Session(engine) as db:
+            yield db
+
+    async def misconfigured_github(self, db, ticket):
+        raise RuntimeError("GitHub App credentials missing")
+
+    with Session(engine) as db:
+        repo = Repository(full_name="example/project", auto_merge=True)
+        ticket = Ticket(repository=repo, number=3, title="Feature", state="READY_TO_MERGE", pr_number=4)
+        db.add(ticket)
+        db.commit()
+        ticket_id = ticket.id
+
+    monkeypatch.setattr(api.settings, "control_token", "admin")
+    monkeypatch.setattr(api.GitHubMergeClient, "reconcile", misconfigured_github)
+    api.app.dependency_overrides[api.db_session] = get_db
+    try:
+        with TestClient(api.app) as client:
+            response = client.post("/reconcile-merges", headers={"Authorization": "Bearer admin"})
+            assert response.status_code == 200
+            assert response.json()[ticket_id] == {"merged": False, "reasons": ["GitHub error: RuntimeError"]}
     finally:
         api.app.dependency_overrides.clear()

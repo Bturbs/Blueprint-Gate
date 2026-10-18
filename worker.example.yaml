@@ -1,44 +1,26 @@
 control_url: http://127.0.0.1:8000
+# For a private HTTPS worker proxy, set an absolute path to its trusted CA PEM.
+# control_ca_bundle: /home/worker/.config/blueprint-gate/control-root.crt
 worker_token_env: ADP_WORKER_TOKEN
-worker_id: vm-dispatcher-1
-capabilities: [vm-supervisor]
+worker_id: my-laptop
+untrusted_user: blueprint-agent
+untrusted_group: blueprint-work
+# In the dedicated VM, require Bubblewrap filesystem confinement for provider
+# CLIs and the model verifier. The bootstrap script enables this by default.
+# untrusted_sandbox: true
+capabilities: [git, codex]
 poll_seconds: 5
-# The dispatcher never has repository checkouts, provider credentials, or gh
-# credentials. It submits bounded envelopes to this mutually authenticated VM
-# supervisor; configure the supervisor and guest image out of band.
-isolation:
-  version: 1
-  backend: vm
-  guest_image_digest: sha256:REPLACE_WITH_64_HEX_IMAGE_DIGEST
-  supervisor_url: https://vm-supervisor.internal.example
-  supervisor_token_env: ADP_VM_SUPERVISOR_TOKEN
-  mount_manifest: []
-  network:
-    direct_route: false
-    proxy_url: https://egress-proxy.internal.example
-  resource_limits:
-    cpu: 2
-    memory_mb: 2048
-    disk_mb: 8192
-    pids: 256
-    runtime_seconds: 900
-    checkpoint_mb: 64
-  stages:
-    product_owner:
-      egress_allowlist: [api.openai.com, github.com, api.github.com]
-      credential_grants: [codex, github_repo]
-    architect:
-      egress_allowlist: [api.openai.com, github.com, api.github.com]
-      credential_grants: [codex, github_repo]
-    threat_modeler:
-      egress_allowlist: [api.openai.com, github.com, api.github.com]
-      credential_grants: [codex, github_threat_model_repo]
-    engineer:
-      egress_allowlist: [api.openai.com, github.com, api.github.com]
-      credential_grants: [codex, github_repo]
-    qa:
-      egress_allowlist: [api.openai.com, github.com, api.github.com]
-      credential_grants: [codex, github_repo]
-    security_engineer:
-      egress_allowlist: [api.openai.com, github.com, api.github.com]
-      credential_grants: [codex, github_repo]
+threat_tool_root: /absolute/path/to/threat-model-tool
+repositories:
+  example/project:
+    path: /absolute/path/to/local/project
+    worktrees: /absolute/path/to/adp-worktrees
+    # Preload a check image in the VM's own Docker daemon. A local sha256 image ID is accepted.
+    check_image: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    threat_root_model: threatModels/Project/Project.yaml
+    # For models kept in a separate repository, use this instead of threat_root_model:
+    # threat_repository:
+    #   full_name: example/threat-models
+    #   path: /absolute/path/to/threat-models
+    #   worktrees: /absolute/path/to/threat-worktrees
+    #   root_model: threatModels/Project/Project.yaml

@@ -19,13 +19,17 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://adp:${POSTGRES_PASSWORD:-adp}@db:5432/adp
       CONTROL_TOKEN: ${CONTROL_TOKEN:?set CONTROL_TOKEN}
-      WORKER_TOKEN: ${WORKER_TOKEN:-}
+      HUMAN_IDENTITY_REQUIRED: ${HUMAN_IDENTITY_REQUIRED:-false}
+      HUMAN_REVIEWER_IDS: ${HUMAN_REVIEWER_IDS:-}
+      HUMAN_OPERATOR_IDS: ${HUMAN_OPERATOR_IDS:-}
       HYBRID_MODE: ${HYBRID_MODE:-false}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_INSTALLATION_ID: ${GITHUB_INSTALLATION_ID:-}
       GITHUB_PRIVATE_KEY_PATH: ${GITHUB_PRIVATE_KEY_PATH:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      GITHUB_WEBHOOK_PREVIOUS_SECRET: ${GITHUB_WEBHOOK_PREVIOUS_SECRET:-}
+      GITHUB_WEBHOOK_PREVIOUS_UNTIL: ${GITHUB_WEBHOOK_PREVIOUS_UNTIL:-}
     depends_on:
       db:
         condition: service_healthy
@@ -42,7 +46,6 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://adp:${POSTGRES_PASSWORD:-adp}@db:5432/adp
       CONTROL_TOKEN: ${CONTROL_TOKEN:?set CONTROL_TOKEN}
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     depends_on:
       control:
         condition: service_healthy

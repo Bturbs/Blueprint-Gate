@@ -1,7 +1,7 @@
 https://localhost:8443 {
     tls internal
 
-    @worker path /health /jobs/claim /jobs/*/heartbeat /jobs/*/yield /jobs/*/complete
+    @worker path /health /jobs/claim /jobs/*/heartbeat /jobs/*/yield /jobs/*/complete /jobs/*/publication-intent
     handle @worker {
         reverse_proxy control:8000
     }

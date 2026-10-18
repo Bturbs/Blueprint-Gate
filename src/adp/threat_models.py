@@ -3,8 +3,11 @@ import asyncio
 import hashlib
 import os
 import signal
+import subprocess
 from pathlib import Path
 import yaml
+
+from adp.process_env import UntrustedSandbox, child_environment, untrusted_argv
 
 
 def discover(root: Path) -> list[Path]:
@@ -41,16 +44,52 @@ def reject_unverified_controls(before: dict[str, bool], after: dict[str, bool]) 
         raise ValueError(f"Design-stage model marked unverified controls in place: {', '.join(added)}")
 
 
-async def verify(root_model: Path, tool_root: Path, timeout: int = 120) -> dict:
+def model_revision(root_model: Path) -> str:
+    digest = hashlib.sha256()
+    for model in sorted(root_model.parent.rglob("*.yaml")):
+        digest.update(str(model.relative_to(root_model.parent)).encode())
+        digest.update(model.read_bytes())
+    return digest.hexdigest()
+
+
+def committed_model_revision(repository: Path, model_directory: Path, commit_sha: str) -> str:
+    """Hash the immutable Git tree using the same relative YAML paths as verify()."""
+    prefix = model_directory.resolve().relative_to(repository.resolve())
+    listing = subprocess.run(
+        ["git", "-C", str(repository), "ls-tree", "-r", "-z", "--name-only", commit_sha, "--", str(prefix)],
+        check=True, capture_output=True,
+    ).stdout
+    digest = hashlib.sha256()
+    for raw_path in sorted(path for path in listing.split(b"\0") if path.endswith(b".yaml")):
+        repo_path = raw_path.decode()
+        relative = str(Path(repo_path).relative_to(prefix))
+        contents = subprocess.run(
+            ["git", "-C", str(repository), "show", f"{commit_sha}:{repo_path}"],
+            check=True, capture_output=True,
+        ).stdout
+        digest.update(relative.encode())
+        digest.update(contents)
+    return digest.hexdigest()
+
+
+async def verify(root_model: Path, tool_root: Path, timeout: int = 120, untrusted_user: str | None = None,
+                 sandbox: UntrustedSandbox | None = None) -> dict:
     if not root_model.is_file():
         return {"passed": False, "error": "Root model not found"}
     script = tool_root / "src/scripts/verify-threat-model.ts"
     if not script.is_file():
         return {"passed": False, "error": "Threat model verifier not installed"}
+    argv = ["npx", "--no-install", "tsx", str(script), str(root_model.resolve())]
+    env = child_environment("verify")
+    if untrusted_user:
+        if sandbox:
+            argv, env = untrusted_argv(argv, untrusted_user, "verify", sandbox=sandbox)
+        else:
+            argv, env = untrusted_argv(argv, untrusted_user, "verify")
     process = await asyncio.create_subprocess_exec(
-        "npx", "--no-install", "tsx", str(script), str(root_model.resolve()),
+        *argv,
         cwd=tool_root, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
+        start_new_session=True, env=env,
     )
     try:
         out, err = await asyncio.wait_for(process.communicate(), timeout)
@@ -68,14 +107,10 @@ async def verify(root_model: Path, tool_root: Path, timeout: int = 120) -> dict:
             pass
         await process.communicate()
         raise
-    digest = hashlib.sha256()
-    for model in sorted(root_model.parent.rglob("*.yaml")):
-        digest.update(str(model.relative_to(root_model.parent)).encode())
-        digest.update(model.read_bytes())
     return {
         "passed": process.returncode == 0,
         "root": str(root_model),
-        "revision": digest.hexdigest(),
+        "revision": model_revision(root_model),
         "stdout": out.decode(errors="replace")[-4000:],
         "stderr": err.decode(errors="replace")[-4000:],
     }

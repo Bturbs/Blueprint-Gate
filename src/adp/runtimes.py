@@ -4,9 +4,28 @@ import json
 import os
 import signal
 import shutil
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+from adp.process_env import UntrustedSandbox, child_environment, untrusted_argv
+
+
+_runtime_user: ContextVar[str | None] = ContextVar("runtime_user", default=None)
+_runtime_sandbox: ContextVar[UntrustedSandbox | None] = ContextVar("runtime_sandbox", default=None)
+
+
+@contextmanager
+def runtime_identity(username: str, sandbox: UntrustedSandbox | None = None):
+    token = _runtime_user.set(username)
+    sandbox_token = _runtime_sandbox.set(sandbox)
+    try:
+        yield
+    finally:
+        _runtime_sandbox.reset(sandbox_token)
+        _runtime_user.reset(token)
 
 
 @dataclass
@@ -45,11 +64,17 @@ async def _terminate_group(process: asyncio.subprocess.Process) -> None:
     await process.communicate()
 
 
-async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int) -> tuple[int, str, str]:
+async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    if env is None and _runtime_user.get():
+        sandbox = _runtime_sandbox.get()
+        if sandbox:
+            argv, env = untrusted_argv(argv, _runtime_user.get(), "runtime", Path(argv[0]).name, sandbox=sandbox)
+        else:
+            argv, env = untrusted_argv(argv, _runtime_user.get(), "runtime", Path(argv[0]).name)
     process = await asyncio.create_subprocess_exec(
         *argv, cwd=cwd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
+        start_new_session=True, env=env if env is not None else child_environment("runtime", Path(argv[0]).name),
     )
     try:
         out, err = await asyncio.wait_for(process.communicate(prompt.encode()), timeout)

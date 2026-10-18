@@ -1,5 +1,7 @@
 import asyncio
 import json
+import grp
+import os
 import subprocess
 
 import pytest
@@ -52,6 +54,70 @@ def test_control_origin_preserves_valid_local_and_tls_urls():
         control_origin("http://control.attacker.example:8000", allow_container_control=True)
 
 
+def test_worker_loads_private_ca_from_config_after_group_switch(tmp_path, monkeypatch):
+    ca = tmp_path / "control-root.crt"
+    ca.write_text("test-root")
+    ca.chmod(0o600)
+    context = object()
+    monkeypatch.setattr(worker.ssl, "create_default_context", lambda *, cafile: context if cafile == str(ca) else None)
+    assert worker.control_tls_verify({"control_ca_bundle": str(ca)}, "https://localhost:8443") is context
+    with pytest.raises(ValueError):
+        worker.control_tls_verify({"control_ca_bundle": str(ca)}, "http://localhost:8000")
+    ca.chmod(0o666)
+    with pytest.raises(ValueError):
+        worker.control_tls_verify({"control_ca_bundle": str(ca)}, "https://localhost:8443")
+
+
+def test_provider_prompt_uses_only_stage_context():
+    sentinel = "UNRELATED_PRIVATE_VALUE"
+    job = {
+        "repository": {"full_name": "example/project", "policy": {"required_checks": [["pytest", "-q"]]}},
+        "ticket": {
+            "number": 5,
+            "title": "Feature",
+            "body": f"Issue-only details {sentinel}",
+            "artifacts": {
+                "requirements": "Required behavior",
+                "design": "Approved design",
+                "tasks": "Implementation tasks",
+                "mitigation_requirements": [{"threat_id": "T1", "countermeasure_id": "C1", "check_command": ["pytest", "-q"]}],
+                "qa_review": {"evidence": "QA feedback", "checks": [{"output": sentinel}]},
+                "security_review": {"evidence": "Security feedback", "checks": [{"output": sentinel}]},
+                "project_item_id": sentinel,
+                "merge_request_uuid": sentinel,
+            },
+            "findings": [{"threat_id": "T1", "note": "Repair boundary"}],
+        },
+    }
+    product_owner = worker._prompt({**job, "stage": "product_owner"})
+    assert "Issue-only details" in product_owner
+    assert "Required behavior" not in product_owner
+    assert "Repair boundary" not in product_owner
+    architect = worker._prompt({**job, "stage": "architect"})
+    assert "Required behavior" in architect
+    assert "Approved design" in architect
+    assert "Implementation tasks" in architect
+    assert "Repair boundary" in architect
+    assert sentinel not in architect
+    engineer = worker._prompt({**job, "stage": "engineer"})
+    assert "Issue-only details" not in engineer
+    assert "Required behavior" in engineer
+    assert "Approved design" in engineer
+    assert "Implementation tasks" in engineer
+    assert "QA feedback" in engineer
+    assert "Security feedback" in engineer
+    assert "Repair boundary" in engineer
+    assert sentinel not in engineer
+    security = worker._prompt({**job, "stage": "security_engineer"})
+    assert "QA feedback" in security
+    assert "Security feedback" in security
+    assert sentinel not in security
+    qa = worker._prompt({**job, "stage": "qa"})
+    assert "QA feedback" in qa
+    assert "Security feedback" in qa
+    assert sentinel not in qa
+
+
 @pytest.mark.asyncio
 async def test_worker_creates_reusable_issue_worktree_and_specs(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
@@ -75,3 +141,72 @@ async def test_worker_creates_reusable_issue_worktree_and_specs(tmp_path, monkey
     assert (spec / "requirements.md").exists()
     assert (spec / "design.md").exists()
     assert (spec / "tasks.md").exists()
+
+
+def test_agent_symlinks_cannot_redirect_spec_writes(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    private = tmp_path / "private"
+    private.mkdir()
+    (checkout / "specs").symlink_to(private, target_is_directory=True)
+    with pytest.raises(OSError):
+        worker._write_specs(checkout, 7, {"requirements": "private overwrite"}, "product_owner")
+    assert list(private.iterdir()) == []
+
+
+def test_agent_fifo_cannot_block_spec_writes(tmp_path):
+    checkout = tmp_path / "checkout"
+    spec = checkout / "specs" / "ISSUE-7"
+    spec.mkdir(parents=True)
+    os.mkfifo(spec / "requirements.md")
+    worker._write_specs(checkout, 7, {"requirements": "# Safe"}, "product_owner")
+    assert (spec / "requirements.md").read_text() == "# Safe"
+
+
+def test_worker_rejects_agent_writable_worktree_parent_and_forged_git_pointer(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README.md").write_text("base")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    root = tmp_path / "worktrees"
+    root.mkdir()
+    root.chmod(0o775)
+    with pytest.raises(ValueError, match="writable by the agent"):
+        worker.worktree(repo, 9, root)
+    root.chmod(0o755)
+    dest = worker.worktree(repo, 9, root)
+    pointer = dest / ".git"
+    pointer.write_text("gitdir: /tmp/attacker-controlled-git\n")
+    with pytest.raises(ValueError, match="Git metadata"):
+        worker.worktree(repo, 9, root)
+
+
+def test_shared_worktree_is_published_once_without_rewalking_agent_files(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README.md").write_text("base")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    group = grp.getgrgid(os.getgid()).gr_name
+    dest = worker.worktree(repo, 10, tmp_path / "worktrees", group_name=group)
+    assert dest.stat().st_mode & 0o7777 == 0o3775
+    assert (dest / ".git").stat().st_mode & 0o777 == 0o440
+    monkeypatch.setattr(worker, "_share_worktree", lambda *_: pytest.fail("existing checkout was reshared"))
+    assert worker.worktree(repo, 10, tmp_path / "worktrees", group_name=group) == dest
+
+
+def test_worker_rejects_writable_base_git_config_before_running_git(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    config = repo / ".git" / "config"
+    config.chmod(0o664)
+    with pytest.raises(ValueError, match="Git metadata"):
+        worker.worktree(repo, 1, tmp_path / "worktrees")
