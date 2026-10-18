@@ -5,13 +5,13 @@ import shutil
 import signal
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import httpx
 import typer
 
 from adp.runtimes import RUNTIMES
 from adp.worker import run_worker
+from adp.control_url import control_origin
 
 app = typer.Typer(help="Autonomous development platform operations")
 
@@ -48,16 +48,15 @@ def worker(config: Path = typer.Option(Path("worker.yaml"), help="Local worker c
     asyncio.run(serve())
 
 
-def _control_client(control_url: str, token_env: str) -> httpx.Client:
-    parsed = urlsplit(control_url)
-    if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
-        raise typer.BadParameter("Control URL must contain only an origin")
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}):
-        raise typer.BadParameter("Remote control plane requires HTTPS")
+def _control_client(control_url: str, token_env: str, *, allow_container_control: bool = False, timeout: float = 15) -> httpx.Client:
+    try:
+        origin = control_origin(control_url, allow_container_control=allow_container_control)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     token = os.environ.get(token_env)
     if not token:
         raise typer.BadParameter(f"Set {token_env} in the environment")
-    return httpx.Client(base_url=control_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    return httpx.Client(base_url=origin, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
 
 
 def _control_path(repository_id: str | None) -> str:
@@ -104,18 +103,18 @@ def control_status(control_url: str, repository_id: str | None = typer.Option(No
 
 
 @app.command()
-def poll(control_url: str, token: str, repository_id: str):
+def poll(control_url: str, repository_id: str, token_env: str = typer.Option("CONTROL_TOKEN")):
     """Poll a configured GitHub repository once."""
-    with httpx.Client(base_url=control_url, headers={"Authorization": f"Bearer {token}"}) as client:
+    with _control_client(control_url, token_env) as client:
         response = client.post(f"/repositories/{repository_id}/poll", timeout=60)
         response.raise_for_status()
         typer.echo(json.dumps(response.json(), indent=2))
 
 
 @app.command()
-def scheduler(control_url: str, token: str, interval: int = 60):
+def scheduler(control_url: str, interval: int = 60, token_env: str = typer.Option("CONTROL_TOKEN")):
     """Continuously reconcile GitHub issues and eligible merges."""
-    with httpx.Client(base_url=control_url, headers={"Authorization": f"Bearer {token}"}, timeout=60) as client:
+    with _control_client(control_url, token_env, allow_container_control=True, timeout=60) as client:
         while True:
             try:
                 repos = client.get("/repositories")

@@ -61,7 +61,9 @@ async def test_repository_checks_fail_closed_without_a_pinned_image(tmp_path):
         await worker._checks(tmp_path, [["python", "-m", "pytest"]], "python:3.12-slim")
 
 
-def test_git_delivery_keeps_its_credential_but_not_worker_or_admin_tokens(tmp_path, monkeypatch):
+
+@pytest.mark.asyncio
+async def test_git_delivery_keeps_its_credential_but_not_worker_or_admin_tokens(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_TOKEN", "admin-secret")
     monkeypatch.setenv("ADP_WORKER_TOKEN", "worker-secret")
     monkeypatch.setenv("GH_TOKEN", "github-secret")
@@ -72,10 +74,17 @@ def test_git_delivery_keeps_its_credential_but_not_worker_or_admin_tokens(tmp_pa
         seen.append((argv[0], kwargs["env"]))
         return subprocess.CompletedProcess(argv, 0, "ok")
 
+    async def fake_remote_run(argv, prompt, cwd, timeout, env=None):
+        seen.append((argv[0], env))
+        if argv[0] == "git":
+            assert argv[1:3] == ["-c", "core.hooksPath=/dev/null"]
+        return 0, "ok", ""
+
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    monkeypatch.setattr(worker, "_run", fake_remote_run)
     assert worker._git(tmp_path, "status") == "ok"
-    assert worker._git(tmp_path, "push", "origin", "test") == "ok"
-    assert worker._gh(tmp_path, "auth", "status") == "ok"
+    assert await worker._remote_cli(tmp_path, ["git", "push", "origin", "test"], None) == "ok"
+    assert await worker._remote_cli(tmp_path, ["gh", "auth", "status"], None) == "ok"
     for (name, child_env), expect_github_token in zip(seen, (False, False, True)):
         assert name in {"git", "gh"}
         assert child_env.get("GH_TOKEN") == ("github-secret" if expect_github_token else None)

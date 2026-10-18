@@ -1,0 +1,11 @@
+https://localhost:8443 {
+    tls internal
+
+    @worker path /health /jobs/claim /jobs/*/heartbeat /jobs/*/yield /jobs/*/complete
+    handle @worker {
+        reverse_proxy control:8000
+    }
+    handle {
+        respond 404
+    }
+}

@@ -47,11 +47,11 @@ async def _terminate_group(process: asyncio.subprocess.Process) -> None:
     await process.communicate()
 
 
-async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int) -> tuple[int, str, str]:
+async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     process = await asyncio.create_subprocess_exec(
         *argv, cwd=cwd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True, env=child_environment("runtime", Path(argv[0]).name),
+        start_new_session=True, env=env if env is not None else child_environment("runtime", Path(argv[0]).name),
     )
     try:
         out, err = await asyncio.wait_for(process.communicate(prompt.encode()), timeout)

@@ -10,7 +10,8 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from adp.db import AuditEvent, ControlState, Job, Repository, RiskAcceptance, SessionLocal, Ticket, WebhookDelivery, WorkerCredential, now
@@ -279,8 +280,9 @@ async def poll(repo_id: str, db: Session = Depends(db_session)):
         if ticket:
             changed = (ticket.title, ticket.body, ticket.dependencies, ticket.priority, ticket.provider_override) != (issue["title"], new_body, new_dependencies, priority, override)
             if changed and ticket.state != "MERGED":
+                active_jobs = db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"])).with_for_update(of=Job)).all()
                 ticket.title, ticket.body, ticket.dependencies, ticket.priority, ticket.provider_override = issue["title"], new_body, new_dependencies, priority, override
-                for job in db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"]))):
+                for job in active_jobs:
                     job.state = "CANCELLED"
                 ticket.state = "NEEDS_REPLAN"
                 ticket.security_approved_revision = None
@@ -300,7 +302,7 @@ async def poll(repo_id: str, db: Session = Depends(db_session)):
     tickets = db.scalars(select(Ticket).where(Ticket.repository_id == repo.id)).all()
     for ticket in tickets:
         if ticket.number not in visible and ticket.state not in {"MERGED", "OUT_OF_SCOPE"}:
-            for job in db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"]))):
+            for job in db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"])).with_for_update(of=Job)):
                 job.state = "CANCELLED"
             ticket.state = "OUT_OF_SCOPE"
             db.add(AuditEvent(ticket_id=ticket.id, action="issue_out_of_scope", detail={"number": ticket.number}))
@@ -411,14 +413,23 @@ def claim(data: ClaimIn, credential: WorkerPrincipal = Depends(worker_authorized
     return None
 
 
+def _locked_claim(db: Session, job_id: str, worker_id: str, fencing_token: int) -> Job:
+    """Serialize claim mutations with reclaim and reject an expired lease."""
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update().execution_options(populate_existing=True))
+    expiry = job.lease_expires_at if job else None
+    if (not job or job.state != "RUNNING" or job.claimed_by != worker_id
+            or job.fencing_token != fencing_token or not expiry
+            or expiry.replace(tzinfo=expiry.tzinfo or timezone.utc) <= now()):
+        raise HTTPException(409, "Stale job claim")
+    return job
+
+
 @app.post("/jobs/{job_id}/heartbeat")
 def heartbeat(job_id: str, data: ClaimIn, fencing_token: int, credential: WorkerPrincipal = Depends(worker_authorized), db: Session = Depends(db_session)):
     if data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
     _lock_worker_credential(db, credential)
-    job = db.get(Job, job_id)
-    if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != fencing_token:
-        raise HTTPException(409, "Stale job claim")
+    job = _locked_claim(db, job_id, data.worker_id, fencing_token)
     job.lease_expires_at = now() + timedelta(minutes=20)
     ticket = db.get(Ticket, job.ticket_id)
     global_state = db.get(ControlState, 1)
@@ -432,9 +443,7 @@ def yield_job(job_id: str, data: YieldIn, credential: WorkerPrincipal = Depends(
     if data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
     _lock_worker_credential(db, credential)
-    job = db.get(Job, job_id)
-    if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != data.fencing_token:
-        raise HTTPException(409, "Stale job claim")
+    job = _locked_claim(db, job_id, data.worker_id, data.fencing_token)
     job.state = "QUEUED"
     # Keep claimed_by as worker affinity so a different host cannot discard partial files.
     job.lease_expires_at = None
@@ -446,7 +455,7 @@ def yield_job(job_id: str, data: YieldIn, credential: WorkerPrincipal = Depends(
 
 @app.post("/jobs/{job_id}/release-affinity", dependencies=[Depends(authorized)])
 def release_job_affinity(job_id: str, db: Session = Depends(db_session)):
-    job = db.get(Job, job_id)
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update().execution_options(populate_existing=True))
     if not job or job.state != "QUEUED" or not job.claimed_by:
         raise HTTPException(409, "Job is not a yielded claim")
     previous_worker = job.claimed_by
@@ -462,9 +471,7 @@ def complete(job_id: str, data: CompleteIn, credential: WorkerPrincipal = Depend
     if data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
     _lock_worker_credential(db, credential)
-    job = db.get(Job, job_id)
-    if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != data.fencing_token:
-        raise HTTPException(409, "Stale job claim")
+    job = _locked_claim(db, job_id, data.worker_id, data.fencing_token)
     ticket = db.get(Ticket, job.ticket_id)
     if data.succeeded:
         try:
@@ -590,7 +597,7 @@ async def reconcile_merges(db: Session = Depends(db_session)):
         if submitted or (ticket.repository.auto_merge and not ticket.repository.paused and not (global_state and global_state.paused)):
             try:
                 results[ticket.id] = await GitHubMergeClient().reconcile(db, ticket)
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, RuntimeError) as exc:
                 results[ticket.id] = {"merged": False, "reasons": [f"GitHub error: {type(exc).__name__}"]}
     return results
 
@@ -602,29 +609,62 @@ async def github_webhook(request: Request, db: Session = Depends(db_session)):
     raw = await request.body()
     if len(raw) > 1024 * 1024:
         raise HTTPException(413, "Webhook payload too large")
-    expected = "sha256=" + hmac.new(settings.github_webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(request.headers.get("x-hub-signature-256", ""), expected):
+    accepted_secrets = [settings.github_webhook_secret]
+    previous_until = settings.github_webhook_previous_until
+    if (settings.github_webhook_previous_secret and previous_until
+            and previous_until.replace(tzinfo=previous_until.tzinfo or timezone.utc) > now()):
+        accepted_secrets.append(settings.github_webhook_previous_secret)
+    signature = request.headers.get("x-hub-signature-256", "")
+    if not any(hmac.compare_digest(signature, "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()) for secret in accepted_secrets):
         raise HTTPException(401, "Invalid webhook signature")
     delivery = request.headers.get("x-github-delivery", "")
     event = request.headers.get("x-github-event", "")
     if not delivery or len(delivery) > 100 or not event:
         raise HTTPException(422, "Missing webhook headers")
-    if db.get(WebhookDelivery, delivery):
-        return {"duplicate": True}
     try:
         payload = json.loads(raw)
     except ValueError as exc:
         raise HTTPException(422, "Invalid JSON payload") from exc
-    if event == "issues":
-        repo_name = (payload.get("repository") or {}).get("full_name")
-        repo = db.scalar(select(Repository).where(Repository.full_name == repo_name)) if repo_name else None
-        if repo:
-            await poll(repo.id, db)
-    elif event == "pull_request":
-        await reconcile_threat_reviews(db)
-        await reconcile_merges(db)
-    elif event == "projects_v2_item":
-        await reconcile_projects(db)
-    db.add(WebhookDelivery(id=delivery, event=event))
-    db.commit()
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "Invalid webhook payload")
+    expected_key = {"issues": "issue", "pull_request": "pull_request", "projects_v2_item": "projects_v2_item"}.get(event)
+    if not expected_key:
+        return {"ignored": True}
+    signed_shapes = {key for key in ("issue", "pull_request", "projects_v2_item") if isinstance(payload.get(key), dict)}
+    if signed_shapes != {expected_key} or not isinstance(payload.get("action"), str):
+        raise HTTPException(422, "Webhook event does not match payload")
+    if event in {"issues", "pull_request"} and ("comment" in payload or "review" in payload):
+        raise HTTPException(422, "Webhook event does not match payload")
+    if event in {"issues", "pull_request"} and not isinstance(payload.get("repository"), dict):
+        raise HTTPException(422, "Webhook repository is missing")
+    # The delivery header is not covered by GitHub's payload signature. The
+    # payload digest also rejects a captured body replayed with a new ID.
+    digest = hashlib.sha256(raw).hexdigest()
+    bind = db.get_bind()
+    # Reconciliation helpers commit or roll back their own Session. Reserve in
+    # a separate transaction so those operations cannot erase dedup evidence.
+    with Session(bind) as reservation:
+        reservation.add(WebhookDelivery(id=delivery, event=event, payload_hash=digest))
+        try:
+            reservation.commit()
+        except IntegrityError:
+            reservation.rollback()
+            return {"duplicate": True}
+    try:
+        if event == "issues":
+            repo_name = (payload.get("repository") or {}).get("full_name")
+            repo = db.scalar(select(Repository).where(Repository.full_name == repo_name)) if repo_name else None
+            if repo:
+                await poll(repo.id, db)
+        elif event == "pull_request":
+            await reconcile_threat_reviews(db)
+            await reconcile_merges(db)
+        elif event == "projects_v2_item":
+            await reconcile_projects(db)
+        db.commit()
+    except Exception:
+        with Session(bind) as reservation:
+            reservation.execute(delete(WebhookDelivery).where(WebhookDelivery.id == delivery, WebhookDelivery.payload_hash == digest))
+            reservation.commit()
+        raise
     return {"accepted": True}

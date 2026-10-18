@@ -96,3 +96,33 @@ def test_issue_edit_invalidates_running_job(monkeypatch):
             assert ticket["jobs"][-1]["state"] == "QUEUED"
     finally:
         api.app.dependency_overrides.clear()
+
+
+def test_merge_reconciliation_reports_github_configuration_error_per_ticket(monkeypatch):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+
+    def get_db():
+        with Session(engine) as db:
+            yield db
+
+    async def misconfigured_github(self, db, ticket):
+        raise RuntimeError("GitHub App credentials missing")
+
+    with Session(engine) as db:
+        repo = Repository(full_name="example/project", auto_merge=True)
+        ticket = Ticket(repository=repo, number=3, title="Feature", state="READY_TO_MERGE", pr_number=4)
+        db.add(ticket)
+        db.commit()
+        ticket_id = ticket.id
+
+    monkeypatch.setattr(api.settings, "control_token", "admin")
+    monkeypatch.setattr(api.GitHubMergeClient, "reconcile", misconfigured_github)
+    api.app.dependency_overrides[api.db_session] = get_db
+    try:
+        with TestClient(api.app) as client:
+            response = client.post("/reconcile-merges", headers={"Authorization": "Bearer admin"})
+            assert response.status_code == 200
+            assert response.json()[ticket_id] == {"merged": False, "reasons": ["GitHub error: RuntimeError"]}
+    finally:
+        api.app.dependency_overrides.clear()

@@ -23,9 +23,9 @@ case "$1" in
   resume) [[ "${CONTROL_TOKEN:-}" == admin-secret ]]; echo false > "$TEST_STATUS"; echo resume >> "$TEST_LOG" ;;
   worker)
     [[ "${ADP_WORKER_TOKEN:-}" == worker-secret ]]
-    if [[ -n "${CONTROL_TOKEN:-}" ]]; then echo admin-leaked >&2; exit 77; fi
-    echo worker >> "$TEST_LOG"
-    ;;
+    [[ -z "${CONTROL_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" && -z "${GITHUB_APP_ID:-}" ]]
+    [[ -z "${GITHUB_INSTALLATION_ID:-}" && -z "${GITHUB_PRIVATE_KEY_PATH:-}" && -z "${GITHUB_WEBHOOK_SECRET:-}" && -z "${GITHUB_WEBHOOK_PREVIOUS_SECRET:-}" ]]
+    echo worker >> "$TEST_LOG" ;;
 esac
 """)
     (root / ".venv" / "bin" / "adp").chmod(0o755)
@@ -78,11 +78,32 @@ def test_worker_only_does_not_require_local_docker_or_database(tmp_path):
     (root / ".env").unlink()
     status = root / "status"
     status.write_text("false")
-    env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}", TEST_STATUS=str(status), TEST_LOG=str(root / "calls"), ADP_WORKER_TOKEN="worker-secret")
-    env["CONTROL_TOKEN"] = "admin-secret"
+    env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}", TEST_STATUS=str(status), TEST_LOG=str(root / "calls"), ADP_WORKER_TOKEN="worker-secret", CONTROL_TOKEN="admin-secret", GITHUB_TOKEN="control-github-token", GITHUB_APP_ID="123", GITHUB_INSTALLATION_ID="456", GITHUB_PRIVATE_KEY_PATH="/tmp/app.pem", GITHUB_WEBHOOK_SECRET="webhook-secret", GITHUB_WEBHOOK_PREVIOUS_SECRET="old-webhook-secret")
     result = subprocess.run([str(script), "--worker-only"], cwd=root, env=env, text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert (root / "calls").read_text().splitlines() == ["worker"]
+
+
+def test_start_selects_app_and_tls_overlays_on_restart(tmp_path):
+    script, root = _fixture(tmp_path)
+    app_key = root / "app.pem"
+    app_key.write_text("test-only-key")
+    (root / "compose.local-tls.yaml").write_text("services: {}\n")
+    with (root / ".env").open("a") as config:
+        config.write(f"GITHUB_APP_PRIVATE_KEY_FILE={app_key}\nBLUEPRINT_LOCAL_TLS=true\n")
+    result = _run(script, root, "--control-only")
+    assert result.returncode == 0, result.stderr
+    assert "docker compose -f compose.yaml -f compose.github-app.yaml -f compose.local-tls.yaml up --build -d" in (root / "calls").read_text()
+
+
+def test_start_rejects_missing_app_key_before_docker(tmp_path):
+    script, root = _fixture(tmp_path)
+    with (root / ".env").open("a") as config:
+        config.write(f"GITHUB_APP_PRIVATE_KEY_FILE={root / 'missing.pem'}\n")
+    result = _run(script, root, "--control-only")
+    assert result.returncode == 1
+    assert "GitHub App private key file is missing" in result.stderr
+    assert not (root / "calls").exists()
 
 
 def test_resume_checks_worker_config_before_clearing_pause(tmp_path):

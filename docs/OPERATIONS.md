@@ -14,6 +14,17 @@ For a fresh local instance, start with `./scripts/start.sh --control-only`, regi
 
 For hybrid mode, terminate HTTPS at a trusted reverse proxy, set `HYBRID_MODE=true`, configure a GitHub App installation and webhook secret, then issue a distinct worker credential for each worker. Workers connect outbound to the HTTPS URL. The scheduler keeps GitHub state reconciled and jobs queued while workers are offline.
 
+## Webhook secret rotation and incident response
+
+Generate a new, unique 32-byte-or-longer random webhook secret in the host's protected secret store; do not put it in Git, shell history, PR text, or command arguments. Set the service's current `GITHUB_WEBHOOK_SECRET` to the new value, `GITHUB_WEBHOOK_PREVIOUS_SECRET` to the old value, and `GITHUB_WEBHOOK_PREVIOUS_UNTIL` to a near-term UTC deadline (for example 15 minutes ahead). Restart the control service and verify its health while GitHub still signs with the old secret. Change the secret in the GitHub App or repository webhook settings to the new value, then send a test event and verify a new signed delivery is accepted once. Remove the previous secret and deadline from service configuration and restart. A test signed with the old secret must now receive HTTP 401; a fresh event signed with the new secret must be accepted. Signature verification stays enabled throughout. Keep scheduler polling active during the cutover.
+
+If compromise is suspected, set a short deadline, change GitHub to a new secret promptly, inspect recent webhook delivery IDs and reconciliation audit events, then remove the old secret immediately after confirming the new delivery. A stolen signed body may be replayed with altered headers, so review unexpected reconciliation activity even when signature checks passed. If the old secret itself was exposed, do not use an overlap; coordinate a direct cutover and rely on scheduled polling for events during the restart. Local staging on a loopback-only Mac can exercise signatures and rotation, but it cannot receive GitHub deliveries without an authenticated HTTPS endpoint.
+### Local HTTPS worker-channel exercise
+
+On a Mac staging host, keep the control API on its existing loopback port and start the optional TLS proxy with `docker compose -f compose.yaml -f compose.local-tls.yaml up -d worker_tls`. The proxy listens only on `127.0.0.1:8443` and forwards `/jobs/claim`, worker heartbeat/yield/complete routes, and `/health`; it returns 404 for administrative routes. It uses Caddy's private local CA for this loopback exercise. Export only the public root certificate with `./scripts/export-local-worker-ca.sh`, then set `SSL_CERT_FILE` to that path for a test worker using `https://localhost:8443`. Use `localhost` so TLS certificate selection has a hostname. Do not disable certificate verification or add this test CA to system-wide trust. Store the worker credential separately from the admin token.
+
+Confirm that a request with the exported CA succeeds, the same request without it fails certificate validation, cleartext remote URLs are rejected before a worker sends its token, and an administrative endpoint returns 404 through the proxy. This loopback proxy is staging evidence only. A remote worker deployment needs a DNS name and trusted certificate, network allowlisting, `HYBRID_MODE=true`, an issued scoped worker credential, and a claim/completion exercise through that exact external route. Keep the API's direct admin port private.
+
 For backlog planning, run `$github-spec-workflow` from a Codex session in the target checkout. The skill reads existing issues before writing and uses that host's `gh` login. Check the proposed ticket map in chat. If the repository is already registered, a new visible issue is picked up on the next poll. Editing an unmerged issue cancels queued/running work, clears its security design approval, and starts requirements replanning. If the repository uses `project_id`, confirm new issues are in the Project; an issue outside it will not be ingested.
 
 ## Pause and recover
@@ -36,13 +47,18 @@ If a yielded worker host is permanently unavailable, an admin can inspect the jo
 
 ## Database backup
 
-Back up PostgreSQL before upgrades and regularly in production. For a local Compose installation, use a host shell with protected backup storage:
+Back up PostgreSQL before upgrades and regularly. On the local macOS staging host, `scripts/backup-postgres.sh` writes a verified custom-format dump under `~/.local/share/blueprint-gate/backups` with directory mode 0700 and file mode 0600. It retains dumps for 14 days by default. `BACKUP_DIR` and `BACKUP_RETENTION_DAYS` can be set for a different location and retention. The scripts target the local `aiworkflow-db-1` container by default; set `BLUEPRINT_GATE_DB_CONTAINER` if the Compose project uses another name. Run one backup and a separate database restore exercise manually:
 
 ```bash
-docker compose exec -T db pg_dump -U adp -Fc adp > adp-backup.dump
+backup="$(scripts/backup-postgres.sh)"
+scripts/test-postgres-restore.sh "$backup"
 ```
 
-Test restores on a separate database. Stop control and scheduler writes before restoring a primary database. Keep the GitHub App private key, webhook secret, admin token, and worker tokens in a separate secret store; database backups do not contain provider CLI credentials or raw worker tokens.
+To compare every restored core row with the live database, pause dispatch and stop the scheduler first, take a fresh backup, then run `COMPARE_LIVE=1 scripts/test-postgres-restore.sh "$backup"`. This requires writes to remain stopped during the comparison. The restore exercise creates a temporary PostgreSQL database, verifies the restored tables, and removes it. A normal restore check verifies schema and readability without assuming the live database has stayed unchanged since the dump.
+
+On macOS, `python3 scripts/install-local-backups.py` copies the scripts to `~/.local/share/blueprint-gate/bin` and installs launchd jobs for a daily 02:00 backup and Sunday 03:00 restore exercise. The copied scripts run from outside `Documents`, where macOS privacy controls can prevent a background launchd job from entering this checkout. The weekly check fails if the newest backup is older than 24 hours (`BACKUP_MAX_AGE_HOURS` can override this). Logs are under `~/.local/share/blueprint-gate/logs`. Inspect them after a missed run or failure. The staging recovery target is at most 24 hours of data loss from the last successful daily run and two hours to restore service, assuming this Mac and Docker remain available. Confirm the last successful timestamp; sleep, shutdown, or a failed run can exceed that target. Keep a verified copy on separately protected storage before relying on backups against host loss or a compromised host user. Mode 0700 local storage alone does not protect against either.
+
+For primary recovery, stop workers, control, and scheduler; retain the failed volume for investigation; create a fresh `adp` database; restore the selected dump with `pg_restore --exit-on-error --no-owner --no-acl`; then restart control and scheduler and inspect ticket, job, approval, audit, and exception state before resuming dispatch. Always perform the separate database restore exercise before replacing a primary database. Keep the GitHub App private key, webhook secret, admin token, and worker tokens in a separate secret store; database backups do not contain provider CLI credentials or raw worker tokens.
 
 ## Worker isolation
 
