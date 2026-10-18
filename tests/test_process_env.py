@@ -27,15 +27,38 @@ async def test_agent_and_repository_checks_do_not_inherit_service_secrets(tmp_pa
     rc, out, err = await _run(argv, "", tmp_path, 10)
     assert (rc, err) == (0, "")
     runtime_env = json.loads(out)
-    checks = await worker._checks(tmp_path, [argv])
-    assert checks[0]["passed"]
-    check_env = json.loads(checks[0]["output"])
+    check_env = child_environment("check")
     for child_env in (runtime_env, check_env):
         assert child_env["PATH"] and child_env["HOME"]
-        assert all(child_env[name] is None for name in (
+        assert all(child_env.get(name) is None for name in (
             "CONTROL_TOKEN", "ADP_WORKER_TOKEN", "GH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN", "UNRELATED_SECRET",
         ))
+
+
+def test_repository_checks_require_a_pinned_isolated_image(tmp_path):
+    image = "example/checks@sha256:" + "a" * 64
+    command = [sys.executable, "-c", "print('ok')"]
+    argv = worker._check_argv(tmp_path, command, image, "blueprint-check-test")
+    assert argv[:2] == ["docker", "run"]
+    assert argv[argv.index("--network") + 1] == "none"
+    assert argv[argv.index("--cap-drop") + 1] == "ALL"
+    assert argv[argv.index("--user") + 1] == "65534:65534"
+    assert argv[argv.index("--mount") + 1].endswith(",dst=/workspace,readonly")
+    assert argv[argv.index("--entrypoint") + 1] == sys.executable
+    assert argv[-3:] == [image, "-c", "print('ok')"]
+    unsafe = tmp_path / "checkout,readonly=false"
+    unsafe.mkdir()
+    with pytest.raises(ValueError, match="Docker mount"):
+        worker._check_argv(unsafe, command, image, "blueprint-check-test")
+
+
+@pytest.mark.asyncio
+async def test_repository_checks_fail_closed_without_a_pinned_image(tmp_path):
+    with pytest.raises(ValueError, match="check_image"):
+        await worker._checks(tmp_path, [["python", "-m", "pytest"]])
+    with pytest.raises(ValueError, match="check_image"):
+        await worker._checks(tmp_path, [["python", "-m", "pytest"]], "python:3.12-slim")
 
 
 def test_git_delivery_keeps_its_credential_but_not_worker_or_admin_tokens(tmp_path, monkeypatch):
