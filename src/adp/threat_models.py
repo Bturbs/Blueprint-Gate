@@ -6,7 +6,7 @@ import signal
 from pathlib import Path
 import yaml
 
-from adp.process_env import child_environment
+from adp.process_env import child_environment, untrusted_argv
 
 
 def discover(root: Path) -> list[Path]:
@@ -43,16 +43,20 @@ def reject_unverified_controls(before: dict[str, bool], after: dict[str, bool]) 
         raise ValueError(f"Design-stage model marked unverified controls in place: {', '.join(added)}")
 
 
-async def verify(root_model: Path, tool_root: Path, timeout: int = 120) -> dict:
+async def verify(root_model: Path, tool_root: Path, timeout: int = 120, untrusted_user: str | None = None) -> dict:
     if not root_model.is_file():
         return {"passed": False, "error": "Root model not found"}
     script = tool_root / "src/scripts/verify-threat-model.ts"
     if not script.is_file():
         return {"passed": False, "error": "Threat model verifier not installed"}
+    argv = ["npx", "--no-install", "tsx", str(script), str(root_model.resolve())]
+    env = child_environment("verify")
+    if untrusted_user:
+        argv, env = untrusted_argv(argv, untrusted_user, "verify")
     process = await asyncio.create_subprocess_exec(
-        "npx", "--no-install", "tsx", str(script), str(root_model.resolve()),
+        *argv,
         cwd=tool_root, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True, env=child_environment("verify"),
+        start_new_session=True, env=env,
     )
     try:
         out, err = await asyncio.wait_for(process.communicate(), timeout)

@@ -1,0 +1,19 @@
+control_url: http://127.0.0.1:8000
+worker_token_env: ADP_WORKER_TOKEN
+worker_id: local-staging-worker
+untrusted_user: blueprint-agent
+untrusted_group: blueprint-work
+capabilities: [git, codex]
+poll_seconds: 5
+threat_tool_root: /srv/blueprint-gate/tools/threat-model-tool
+repositories:
+  Bturbs/Blueprint-Gate:
+    path: /srv/blueprint-gate/repos/Blueprint-Gate
+    worktrees: /srv/blueprint-gate/worktrees/Blueprint-Gate
+    # Build and preload a project-specific check image. Use its sha256 image ID.
+    check_image: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    threat_repository:
+      full_name: Bturbs/Threat-Models
+      path: /srv/blueprint-gate/repos/Threat-Models
+      worktrees: /srv/blueprint-gate/worktrees/Threat-Models
+      root_model: threatModels/BlueprintGate/BlueprintGate.yaml

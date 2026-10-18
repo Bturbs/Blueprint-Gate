@@ -4,11 +4,25 @@ import json
 import os
 import signal
 import shutil
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from adp.process_env import child_environment
+from adp.process_env import child_environment, untrusted_argv
+
+
+_runtime_user: ContextVar[str | None] = ContextVar("runtime_user", default=None)
+
+
+@contextmanager
+def runtime_identity(username: str):
+    token = _runtime_user.set(username)
+    try:
+        yield
+    finally:
+        _runtime_user.reset(token)
 
 
 @dataclass
@@ -48,6 +62,8 @@ async def _terminate_group(process: asyncio.subprocess.Process) -> None:
 
 
 async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    if env is None and _runtime_user.get():
+        argv, env = untrusted_argv(argv, _runtime_user.get(), "runtime", Path(argv[0]).name)
     process = await asyncio.create_subprocess_exec(
         *argv, cwd=cwd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

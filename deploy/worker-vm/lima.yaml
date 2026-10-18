@@ -1,0 +1,12 @@
+# Dedicated local staging worker. Plain mode disables all Mac directory mounts,
+# SSH agent forwarding, guest agent sharing, and dynamic host port forwarding.
+minimumLimaVersion: 2.0.0
+base:
+  - template:docker
+plain: true
+mounts: []
+ssh:
+  forwardAgent: false
+cpus: 4
+memory: 8GiB
+disk: 60GiB

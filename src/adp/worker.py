@@ -3,12 +3,15 @@ import asyncio
 import json
 import fnmatch
 import fcntl
+import grp
 import os
 import signal
 import sys
+from contextlib import nullcontext
 from importlib.resources import files
 import re
 import subprocess
+import stat
 from pathlib import Path
 from typing import Awaitable, Callable
 from uuid import uuid4
@@ -16,8 +19,8 @@ from uuid import uuid4
 import httpx
 import yaml
 
-from adp.runtimes import _run, candidate_runtimes
-from adp.process_env import child_environment
+from adp.runtimes import _run, candidate_runtimes, runtime_identity
+from adp.process_env import child_environment, untrusted_argv
 from adp.control_url import control_origin
 from adp.threat_models import in_place_controls, reject_unverified_controls, verify
 
@@ -49,25 +52,169 @@ async def _remote_cli(cwd: Path, argv: list[str], guard: Callable[[], Awaitable[
     return output.strip()
 
 
-def worktree(repo_path: Path, number: int, worktree_root: Path, namespace: str = "") -> Path:
+def worktree(repo_path: Path, number: int, worktree_root: Path, namespace: str = "", group_name: str | None = None) -> Path:
     slug = re.sub(r"[^a-zA-Z0-9-]", "-", namespace).strip("-")
     stem = f"{slug}-issue-{number}" if slug else f"issue-{number}"
     branch = f"adp/{stem}"
     dest = worktree_root / stem
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not worktree_root.exists():
+        # The parent must already be trusted. Create the configured root
+        # privately before allowing the agent to traverse it.
+        _assert_trusted_worktree_path(repo_path, worktree_root)
+        worktree_root.mkdir(mode=0o700)
+        if group_name:
+            os.chown(worktree_root, -1, grp.getgrnam(group_name).gr_gid)
+            worktree_root.chmod(0o2755)
+        else:
+            worktree_root.chmod(0o755)
+    _assert_trusted_worktree_path(repo_path, dest)
+    _assert_protected_git_tree(repo_path / ".git")
     with (worktree_root / ".adp-worktree.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if dest.is_symlink():
+            raise ValueError("Issue worktree cannot be a symlink")
         if dest.is_dir():
+            _assert_worktree_metadata(repo_path, dest)
+            _assert_shared_worktree(dest, group_name)
             current = _git(dest, "branch", "--show-current")
             if current != branch:
                 raise ValueError("Existing worktree has wrong branch")
             return dest
         existing = _git(repo_path, "branch", "--list", branch)
-        if existing:
-            _git(repo_path, "worktree", "add", str(dest), branch)
-        else:
-            _git(repo_path, "worktree", "add", "-b", branch, str(dest))
+        old_umask = os.umask(0o077) if group_name else None
+        try:
+            if existing:
+                _git(repo_path, "worktree", "add", str(dest), branch)
+            else:
+                _git(repo_path, "worktree", "add", "-b", branch, str(dest))
+        finally:
+            if old_umask is not None:
+                os.umask(old_umask)
+        _assert_worktree_metadata(repo_path, dest)
+        # The new root is mode 0700 until the permission pass finishes. No
+        # agent process can rename entries during this one-time publication.
+        if group_name and stat.S_IMODE(dest.stat().st_mode) & 0o777 != 0o700:
+            raise ValueError("New issue worktree was not created privately")
+        _share_git_metadata(repo_path / ".git", group_name)
+        _share_worktree(dest, group_name)
     return dest
+
+
+def _assert_trusted_worktree_path(repo_path: Path, dest: Path) -> None:
+    for directory in (dest.parent, *dest.parent.parents, repo_path, *repo_path.parents):
+        if directory.is_symlink():
+            raise ValueError("Worker checkout path cannot use a symlink")
+        metadata = directory.stat()
+        if metadata.st_uid not in (0, os.geteuid()):
+            raise ValueError(f"Worker checkout parent has an untrusted owner: {directory}")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (metadata.st_mode & stat.S_ISVTX and metadata.st_uid == 0):
+            raise ValueError(f"Worker checkout parent is writable by the agent: {directory}")
+    if dest.parent.stat().st_uid != os.geteuid():
+        raise ValueError("Worktree root must be owned by the supervisor")
+
+
+def _assert_worktree_metadata(repo_path: Path, dest: Path) -> None:
+    git_file = dest / ".git"
+    if dest.is_symlink() or git_file.is_symlink() or not git_file.is_file():
+        raise ValueError("Issue worktree must use protected Git metadata")
+    for path in (dest, git_file):
+        metadata = path.stat(follow_symlinks=False)
+        if metadata.st_uid != os.geteuid():
+            raise ValueError("Issue worktree metadata must be owned by the supervisor")
+    if git_file.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ValueError("Issue Git metadata is writable by the agent")
+    base_git = repo_path / ".git"
+    if base_git.is_symlink() or not base_git.is_dir():
+        raise ValueError("Base checkout needs a protected Git directory")
+    _assert_protected_git_tree(base_git)
+    value = git_file.read_text().strip()
+    if not value.startswith("gitdir: ") or "\n" in value:
+        raise ValueError("Invalid issue Git metadata pointer")
+    try:
+        linked_gitdir = Path(value.removeprefix("gitdir: ")).resolve(strict=True)
+        trusted_worktrees = (base_git / "worktrees").resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("Issue Git metadata pointer is missing") from exc
+    if linked_gitdir.parent != trusted_worktrees:
+        raise ValueError("Issue Git metadata points outside the trusted checkout")
+    metadata = linked_gitdir.stat()
+    if metadata.st_uid != os.geteuid() or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ValueError("Issue Git metadata is writable by the agent")
+
+
+def _assert_protected_git_tree(base_git: Path) -> None:
+    """Git config, attributes, and linked worktree metadata must stay trusted."""
+    if base_git.is_symlink() or not base_git.is_dir():
+        raise ValueError("Base checkout needs a protected Git directory")
+    for directory, dirs, files in os.walk(base_git, followlinks=False):
+        for name in [None, *dirs, *files]:
+            path = Path(directory) if name is None else Path(directory) / name
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise ValueError(f"Git metadata is writable or redirected by the agent: {path}")
+
+
+def _share_git_metadata(base_git: Path, group_name: str | None) -> None:
+    """Let the agent inspect Git state without changing supervisor metadata."""
+    if not group_name:
+        return
+    _assert_protected_git_tree(base_git)
+    group_id = grp.getgrnam(group_name).gr_gid
+    for directory, dirs, files in os.walk(base_git, followlinks=False):
+        for name in [None, *dirs, *files]:
+            path = Path(directory) if name is None else Path(directory) / name
+            metadata = path.lstat()
+            os.chown(path, -1, group_id, follow_symlinks=False)
+            minimum = 0o750 if stat.S_ISDIR(metadata.st_mode) else 0o640
+            os.chmod(path, (stat.S_IMODE(metadata.st_mode) | minimum) & ~0o022, follow_symlinks=False)
+    _assert_protected_git_tree(base_git)
+
+
+def _share_worktree(cwd: Path, group_name: str | None) -> None:
+    """Publish a newly created private checkout to the agent once."""
+    if not group_name:
+        return
+    if cwd.is_symlink():
+        raise ValueError("Issue worktree cannot be a symlink")
+    if (cwd / ".git").is_symlink() or not (cwd / ".git").is_file():
+        raise ValueError("Issue worktree must use protected Git metadata")
+    if (cwd / ".git").stat().st_uid != os.geteuid():
+        raise ValueError("Issue Git metadata must be owned by the supervisor")
+    group_id = grp.getgrnam(group_name).gr_gid
+    if stat.S_IMODE(cwd.stat().st_mode) & 0o777 != 0o700:
+        raise ValueError("Only a private new worktree can be shared")
+    for directory, dirs, files in os.walk(cwd, followlinks=False):
+        for name in [None, *dirs, *files]:
+            path = Path(directory) if name is None else Path(directory) / name
+            if path.is_symlink():
+                continue
+            metadata = path.stat(follow_symlinks=False)
+            is_directory = stat.S_ISDIR(metadata.st_mode)
+            if metadata.st_uid == os.geteuid():
+                os.chown(path, -1, group_id, follow_symlinks=False)
+                if path.name == ".git":
+                    os.chmod(path, 0o440, follow_symlinks=False)
+                elif path == cwd:
+                    continue  # Publish the root only after all descendants are ready.
+                elif is_directory:
+                    os.chmod(path, stat.S_IMODE(metadata.st_mode) | 0o2775 | (stat.S_ISVTX if path == cwd else 0), follow_symlinks=False)
+                else:
+                    os.chmod(path, stat.S_IMODE(metadata.st_mode) | 0o664, follow_symlinks=False)
+            elif metadata.st_gid != group_id or not (metadata.st_mode & stat.S_IRGRP) or (is_directory and not (metadata.st_mode & stat.S_IXGRP)):
+                raise ValueError(f"Issue worktree contains inaccessible path: {path}")
+    os.chmod(cwd, 0o3775, follow_symlinks=False)
+
+
+def _assert_shared_worktree(cwd: Path, group_name: str | None) -> None:
+    if not group_name:
+        return
+    group_id = grp.getgrnam(group_name).gr_gid
+    root = cwd.stat(follow_symlinks=False)
+    pointer = (cwd / ".git").stat(follow_symlinks=False)
+    if root.st_gid != group_id or stat.S_IMODE(root.st_mode) != 0o3775:
+        raise ValueError("Issue worktree has not been safely shared")
+    if pointer.st_uid != os.geteuid() or stat.S_IMODE(pointer.st_mode) != 0o440:
+        raise ValueError("Issue Git metadata is not protected")
 
 
 def _parse_object(text: str) -> dict:
@@ -115,14 +262,45 @@ def _prompt(job: dict, threat_root_model: str | None = None) -> str:
 
 
 def _write_specs(cwd: Path, number: int, result: dict, stage: str):
-    directory = cwd / "specs" / f"ISSUE-{number}"
-    directory.mkdir(parents=True, exist_ok=True)
     names = {"requirements": "requirements.md", "design": "design.md", "tasks": "tasks.md"}
-    for key in ({"product_owner": ["requirements"], "architect": ["design", "tasks"]}.get(stage, [])):
+    selected = {"product_owner": ["requirements"], "architect": ["design", "tasks"]}.get(stage, [])
+    if not selected:
+        return
+    values = {}
+    for key in selected:
         value = result.get(key)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"Missing {key} artifact")
-        (directory / names[key]).write_text(value, encoding="utf-8")
+        values[names[key]] = value
+    # The agent can create symlinks in the checkout. Keep each lookup beneath
+    # a pinned directory fd and reject symlinks even if it leaves a child alive.
+    directory_fd = os.open(cwd, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in ("specs", f"ISSUE-{number}"):
+            try:
+                os.mkdir(component, 0o775, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        for filename, value in values.items():
+            # A prior agent can leave a FIFO or symlink at the destination.
+            # Create a regular file under a fresh name, then replace the entry
+            # itself without opening the agent-controlled destination.
+            temp_name = f".{filename}.{uuid4().hex}.tmp"
+            file_fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o664, dir_fd=directory_fd)
+            try:
+                with os.fdopen(file_fd, "w", encoding="utf-8") as output:
+                    output.write(value)
+                os.replace(temp_name, filename, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            finally:
+                try:
+                    os.unlink(temp_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+    finally:
+        os.close(directory_fd)
 
 
 async def _check_output_tail(stream: asyncio.StreamReader) -> bytes:
@@ -163,8 +341,8 @@ def _check_argv(cwd: Path, command: list[str], image: str, name: str) -> list[st
 
 
 async def _checks(cwd: Path, commands: list[list[str]], image: str | None = None) -> list[dict]:
-    if commands and (not isinstance(image, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}", image)):
-        raise ValueError("Worker check_image must be a locally available image pinned by SHA-256 digest")
+    if commands and (not isinstance(image, str) or not re.fullmatch(r"(?:[A-Za-z0-9][A-Za-z0-9._:/-]*@)?sha256:[a-f0-9]{64}", image)):
+        raise ValueError("Worker check_image must be a locally available image pinned by SHA-256 digest or image ID")
     results = []
     for command in commands:
         if not command or not all(isinstance(x, str) for x in command):
@@ -205,14 +383,14 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
     repo_path = Path(local["path"]).expanduser().resolve()
     if not (repo_path / ".git").exists() and not _git(repo_path, "rev-parse", "--is-inside-work-tree") == "true":
         raise ValueError("Configured path is not a Git repository")
-    app_cwd = worktree(repo_path, job["ticket"]["number"], Path(local.get("worktrees", repo_path.parent / "adp-worktrees")))
+    app_cwd = worktree(repo_path, job["ticket"]["number"], Path(local.get("worktrees", repo_path.parent / "adp-worktrees")), group_name=config.get("untrusted_group"))
     stage = job["stage"]
     threat_config = local.get("threat_repository", {})
     if stage == "threat_modeler" and threat_config:
         threat_repo = Path(threat_config["path"]).expanduser().resolve()
         if _git(threat_repo, "rev-parse", "--is-inside-work-tree") != "true":
             raise ValueError("Threat repository path is not a Git checkout")
-        cwd = worktree(threat_repo, job["ticket"]["number"], Path(threat_config.get("worktrees", threat_repo.parent / "adp-threat-worktrees")), namespace=full_name)
+        cwd = worktree(threat_repo, job["ticket"]["number"], Path(threat_config.get("worktrees", threat_repo.parent / "adp-threat-worktrees")), namespace=full_name, group_name=config.get("untrusted_group"))
         root_rel = threat_config["root_model"]
     else:
         cwd = app_cwd
@@ -230,16 +408,18 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
     response = None
     chosen = None
     candidates = candidate_runtimes(policy, stage)
-    for runtime in candidates:
-        status = await runtime.validate_environment()
-        if not status.get("available"):
-            continue
-        response = await runtime.execute(_prompt(job, root_rel), cwd, timeout=int(policy.get("agent_timeout_seconds", 900)), writable=stage in {"threat_modeler", "engineer"})
-        if response.status == "succeeded":
-            chosen = runtime
-            break
-        if not response.error or not re.search(r"(?i)(rate.?limit|\b429\b|quota)", response.error):
-            raise RuntimeError(f"Agent failed: {response.error}")
+    untrusted_user = config.get("untrusted_user")
+    with runtime_identity(untrusted_user) if untrusted_user else nullcontext():
+        for runtime in candidates:
+            status = await runtime.validate_environment()
+            if not status.get("available"):
+                continue
+            response = await runtime.execute(_prompt(job, root_rel), cwd, timeout=int(policy.get("agent_timeout_seconds", 900)), writable=stage in {"threat_modeler", "engineer"})
+            if response.status == "succeeded":
+                chosen = runtime
+                break
+            if not response.error or not re.search(r"(?i)(rate.?limit|\b429\b|quota)", response.error):
+                raise RuntimeError(f"Agent failed: {response.error}")
     if chosen is None or response is None:
         raise RuntimeError("No approved provider is available")
     result = _parse_object(response.output)
@@ -258,7 +438,7 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
         if not root.is_relative_to(cwd):
             raise ValueError("Threat model path escapes worktree")
         reject_unverified_controls(before_controls, in_place_controls(root.parent))
-        verification = await verify(root, Path(tool_path).expanduser())
+        verification = await verify(root, Path(tool_path).expanduser(), untrusted_user=untrusted_user)
         result["verification"] = verification
         result["verification_passed"] = verification["passed"]
         result["threat_revision"] = verification.get("revision")
@@ -297,7 +477,7 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
             model_root = (app_cwd / local["threat_root_model"]).resolve()
             if not model_root.is_relative_to(app_cwd):
                 raise ValueError("Threat model path escapes worktree")
-            model_result = await verify(model_root, Path(config["threat_tool_root"]).expanduser())
+            model_result = await verify(model_root, Path(config["threat_tool_root"]).expanduser(), untrusted_user=untrusted_user)
             result["model_consistency"] = model_result
             if not model_result["passed"] or model_result["revision"] != job["ticket"].get("threat_revision"):
                 raise ValueError("Implementation changed or invalidated the approved threat model")
@@ -339,6 +519,29 @@ class PauseRequested(Exception):
 
 class ClaimLost(Exception):
     """The job claim is no longer safe to use."""
+
+
+def _assert_isolated_worker(config: dict) -> None:
+    """Fail before claiming a job if the worker can run under the Mac account."""
+    if sys.platform != "linux" or Path("/.dockerenv").exists():
+        raise ValueError("Issue workers require a dedicated Linux VM, not a host account or container")
+    virtualization = subprocess.run(["systemd-detect-virt", "--vm", "--quiet"], capture_output=True, timeout=5)
+    if virtualization.returncode:
+        raise ValueError("Issue workers require a dedicated Linux VM")
+    mount_filesystems = [line.split(" - ", 1)[1].split(" ", 1)[0] for line in Path("/proc/self/mountinfo").read_text().splitlines() if " - " in line]
+    if any(kind in {"virtiofs", "9p", "nfs", "nfs4", "cifs", "smb3"} or kind == "fuse" or kind.startswith("fuse.") for kind in mount_filesystems):
+        raise ValueError("Worker VM must not mount host directories")
+    username = config.get("untrusted_user")
+    if not isinstance(username, str):
+        raise ValueError("Configure a separate untrusted_user for provider CLIs and verification")
+    group_name = config.get("untrusted_group")
+    if not isinstance(group_name, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", group_name):
+        raise ValueError("Configure a shared untrusted_group for issue worktrees")
+    grp.getgrnam(group_name)
+    argv, env = untrusted_argv(["true"], username, "verify")
+    result = subprocess.run(argv, env=env, capture_output=True, timeout=5)
+    if result.returncode:
+        raise ValueError("Cannot switch to the untrusted worker identity")
 
 
 async def _check_claim(client: httpx.AsyncClient, job: dict, worker_id: str) -> None:
@@ -391,6 +594,8 @@ async def run_worker(config_path: Path, once: bool = False):
         raise ValueError("Administrator credential cannot be used as a worker token")
     if os.environ.get("CONTROL_TOKEN") and token == os.environ["CONTROL_TOKEN"]:
         raise ValueError("Worker and administrator credentials must be different")
+    _assert_isolated_worker(config)
+    os.umask(0o027)  # Later supervisor Git writes stay group-readable, not writable.
     os.environ.pop("CONTROL_TOKEN", None)
     os.environ.pop(token_env, None)
     headers = {"Authorization": f"Bearer {token}"}

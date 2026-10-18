@@ -1,5 +1,7 @@
 import asyncio
 import json
+import grp
+import os
 import subprocess
 
 import pytest
@@ -123,3 +125,72 @@ async def test_worker_creates_reusable_issue_worktree_and_specs(tmp_path, monkey
     assert (spec / "requirements.md").exists()
     assert (spec / "design.md").exists()
     assert (spec / "tasks.md").exists()
+
+
+def test_agent_symlinks_cannot_redirect_spec_writes(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    private = tmp_path / "private"
+    private.mkdir()
+    (checkout / "specs").symlink_to(private, target_is_directory=True)
+    with pytest.raises(OSError):
+        worker._write_specs(checkout, 7, {"requirements": "private overwrite"}, "product_owner")
+    assert list(private.iterdir()) == []
+
+
+def test_agent_fifo_cannot_block_spec_writes(tmp_path):
+    checkout = tmp_path / "checkout"
+    spec = checkout / "specs" / "ISSUE-7"
+    spec.mkdir(parents=True)
+    os.mkfifo(spec / "requirements.md")
+    worker._write_specs(checkout, 7, {"requirements": "# Safe"}, "product_owner")
+    assert (spec / "requirements.md").read_text() == "# Safe"
+
+
+def test_worker_rejects_agent_writable_worktree_parent_and_forged_git_pointer(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README.md").write_text("base")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    root = tmp_path / "worktrees"
+    root.mkdir()
+    root.chmod(0o775)
+    with pytest.raises(ValueError, match="writable by the agent"):
+        worker.worktree(repo, 9, root)
+    root.chmod(0o755)
+    dest = worker.worktree(repo, 9, root)
+    pointer = dest / ".git"
+    pointer.write_text("gitdir: /tmp/attacker-controlled-git\n")
+    with pytest.raises(ValueError, match="Git metadata"):
+        worker.worktree(repo, 9, root)
+
+
+def test_shared_worktree_is_published_once_without_rewalking_agent_files(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README.md").write_text("base")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    group = grp.getgrgid(os.getgid()).gr_name
+    dest = worker.worktree(repo, 10, tmp_path / "worktrees", group_name=group)
+    assert dest.stat().st_mode & 0o7777 == 0o3775
+    assert (dest / ".git").stat().st_mode & 0o777 == 0o440
+    monkeypatch.setattr(worker, "_share_worktree", lambda *_: pytest.fail("existing checkout was reshared"))
+    assert worker.worktree(repo, 10, tmp_path / "worktrees", group_name=group) == dest
+
+
+def test_worker_rejects_writable_base_git_config_before_running_git(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    config = repo / ".git" / "config"
+    config.chmod(0o664)
+    with pytest.raises(ValueError, match="Git metadata"):
+        worker.worktree(repo, 1, tmp_path / "worktrees")

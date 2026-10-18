@@ -1,6 +1,8 @@
 """Give each worker subprocess only the environment it needs."""
 
 import os
+import pwd
+import re
 from urllib.parse import urlsplit
 
 
@@ -57,3 +59,25 @@ def child_environment(purpose: str, provider: str | None = None) -> dict[str, st
         if parsed.username or parsed.password:
             selected.pop(name)
     return selected
+
+
+def untrusted_argv(argv: list[str], username: str, purpose: str, provider: str | None = None) -> tuple[list[str], dict[str, str]]:
+    """Run checkout-driven tools as a separate Unix identity, with a fresh env.
+
+    The worker account holds its claim and delivery credentials. The agent
+    account owns only provider credentials and writable checkout content.
+    """
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
+        raise ValueError("Invalid untrusted worker username")
+    account = pwd.getpwnam(username)
+    if account.pw_uid == 0 or account.pw_uid == os.getuid():
+        raise ValueError("Untrusted commands require a distinct non-root Unix identity")
+    allowed = child_environment(purpose, provider)
+    for key in ("HOME", "USER", "LOGNAME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "VIRTUAL_ENV"):
+        allowed.pop(key, None)
+    allowed.update({"HOME": account.pw_dir, "USER": username, "LOGNAME": username})
+    if provider == "codex":
+        allowed["CODEX_HOME"] = f"{account.pw_dir}/.codex"
+    elif provider == "claude":
+        allowed["CLAUDE_CONFIG_DIR"] = f"{account.pw_dir}/.claude"
+    return ["sudo", "-n", "-u", username, "--", "env", "-i", *(f"{key}={value}" for key, value in allowed.items()), "sh", "-c", 'umask 002; exec "$@"', "sh", *argv], child_environment("check")

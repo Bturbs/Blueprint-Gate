@@ -2,12 +2,13 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from adp import worker
-from adp.process_env import child_environment
-from adp.runtimes import _run
+from adp.process_env import child_environment, untrusted_argv
+from adp.runtimes import _run, runtime_identity
 
 
 _ENV_PROBE = """import json, os
@@ -47,6 +48,7 @@ def test_repository_checks_require_a_pinned_isolated_image(tmp_path):
     assert argv[argv.index("--mount") + 1].endswith(",dst=/workspace,readonly")
     assert argv[argv.index("--entrypoint") + 1] == sys.executable
     assert argv[-3:] == [image, "-c", "print('ok')"]
+    assert worker._check_argv(tmp_path, command, "sha256:" + "b" * 64, "blueprint-check-test")[-3:] == ["sha256:" + "b" * 64, "-c", "print('ok')"]
     unsafe = tmp_path / "checkout,readonly=false"
     unsafe.mkdir()
     with pytest.raises(ValueError, match="Docker mount"):
@@ -156,6 +158,7 @@ async def test_direct_worker_launch_removes_service_tokens_before_claim(tmp_path
     config.write_text("control_url: http://127.0.0.1:8000\nworker_token_env: ADP_WORKER_TOKEN\n")
     monkeypatch.setenv("CONTROL_TOKEN", "admin-secret")
     monkeypatch.setenv("ADP_WORKER_TOKEN", "worker-secret")
+    monkeypatch.setattr(worker, "_assert_isolated_worker", lambda config: None)
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -206,3 +209,54 @@ def test_authenticated_proxy_credentials_are_not_inherited_by_untrusted_commands
     env = child_environment("check")
     assert "HTTPS_PROXY" not in env
     assert env["HTTP_PROXY"] == "http://proxy.example:8080"
+
+
+def test_untrusted_identity_gets_only_its_provider_home(tmp_path, monkeypatch):
+    monkeypatch.setattr("adp.process_env.pwd.getpwnam", lambda name: SimpleNamespace(pw_uid=10001, pw_dir="/home/blueprint-agent"))
+    monkeypatch.setattr("adp.process_env.os.getuid", lambda: 501)
+    monkeypatch.setenv("HOME", "/home/supervisor")
+    monkeypatch.setenv("CODEX_HOME", "/home/supervisor/.codex")
+    monkeypatch.setenv("GH_TOKEN", "delivery-secret")
+    monkeypatch.setenv("ADP_WORKER_TOKEN", "claim-secret")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "other-provider-secret")
+    argv, outer_env = untrusted_argv(["codex", "exec"], "blueprint-agent", "runtime", "codex")
+    assert argv[:7] == ["sudo", "-n", "-u", "blueprint-agent", "--", "env", "-i"]
+    assert "HOME=/home/blueprint-agent" in argv
+    assert "CODEX_HOME=/home/blueprint-agent/.codex" in argv
+    assert not any("secret" in value or "/home/supervisor" in value for value in argv)
+    assert "GH_TOKEN" not in outer_env and "ADP_WORKER_TOKEN" not in outer_env
+    with pytest.raises(ValueError, match="distinct non-root"):
+        monkeypatch.setattr("adp.process_env.os.getuid", lambda: 10001)
+        untrusted_argv(["codex"], "blueprint-agent", "runtime", "codex")
+
+
+@pytest.mark.asyncio
+async def test_runtime_identity_wraps_provider_invocations(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_identity(argv, username, purpose, provider):
+        seen.append((argv, username, purpose, provider))
+        return ["identity-wrapper", *argv], {"PATH": os.environ["PATH"]}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _input):
+            return b"ok", b""
+
+    async def fake_spawn(*argv, **kwargs):
+        seen.append((argv, kwargs["env"]))
+        return FakeProcess()
+
+    monkeypatch.setattr("adp.runtimes.untrusted_argv", fake_identity)
+    monkeypatch.setattr("adp.runtimes.asyncio.create_subprocess_exec", fake_spawn)
+    with runtime_identity("blueprint-agent"):
+        assert await _run(["codex", "login", "status"], "", tmp_path, 10) == (0, "ok", "")
+    assert seen[0][1:] == ("blueprint-agent", "runtime", "codex")
+    assert seen[1][0][0] == "identity-wrapper"
+
+
+def test_host_worker_cannot_claim_jobs():
+    if sys.platform != "linux":
+        with pytest.raises(ValueError, match="dedicated Linux VM"):
+            worker._assert_isolated_worker({"untrusted_user": "blueprint-agent"})
