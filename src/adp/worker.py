@@ -93,7 +93,7 @@ def worktree(repo_path: Path, number: int, worktree_root: Path, namespace: str =
         _assert_worktree_metadata(repo_path, dest)
         # The new root is mode 0700 until the permission pass finishes. No
         # agent process can rename entries during this one-time publication.
-        if group_name and stat.S_IMODE(dest.stat().st_mode) != 0o700:
+        if group_name and stat.S_IMODE(dest.stat().st_mode) & 0o777 != 0o700:
             raise ValueError("New issue worktree was not created privately")
         _share_git_metadata(repo_path / ".git", group_name)
         _share_worktree(dest, group_name)
@@ -181,7 +181,7 @@ def _share_worktree(cwd: Path, group_name: str | None) -> None:
     if (cwd / ".git").stat().st_uid != os.geteuid():
         raise ValueError("Issue Git metadata must be owned by the supervisor")
     group_id = grp.getgrnam(group_name).gr_gid
-    if stat.S_IMODE(cwd.stat().st_mode) != 0o700:
+    if stat.S_IMODE(cwd.stat().st_mode) & 0o777 != 0o700:
         raise ValueError("Only a private new worktree can be shared")
     for directory, dirs, files in os.walk(cwd, followlinks=False):
         for name in [None, *dirs, *files]:
