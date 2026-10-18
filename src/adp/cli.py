@@ -124,6 +124,8 @@ def scheduler(control_url: str, interval: int = 60, token_env: str = typer.Optio
                     response.raise_for_status()
                 response = client.post("/reconcile-threat-reviews")
                 response.raise_for_status()
+                response = client.post("/reconcile-publications")
+                response.raise_for_status()
                 response = client.post("/reconcile-merges")
                 response.raise_for_status()
                 response = client.post("/reconcile-projects")

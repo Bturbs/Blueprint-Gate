@@ -68,6 +68,21 @@ class Job(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PublicationAttempt(Base):
+    __tablename__ = "publication_attempts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), index=True)
+    ticket_id: Mapped[str] = mapped_column(ForeignKey("tickets.id"), index=True)
+    repository: Mapped[str] = mapped_column(String(255))
+    branch: Mapped[str] = mapped_column(String(255), unique=True)
+    sha: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(30), default="ACTIVE", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_context: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class Approval(Base):
     __tablename__ = "approvals"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))

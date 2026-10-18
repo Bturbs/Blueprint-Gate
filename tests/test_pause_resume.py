@@ -190,7 +190,7 @@ async def test_worker_interruption_yields_claim_and_reuses_worktree(control, tmp
     monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.ASGITransport(app=api.app), **kwargs))
     started = asyncio.Event()
 
-    async def unfinished(job, config, guard=None):
+    async def unfinished(job, config, guard=None, publish_intent=None):
         cwd = worker.worktree(repo, job["ticket"]["number"], tmp_path / "worktrees")
         (cwd / "partial.txt").write_text("saved progress")
         started.set()
