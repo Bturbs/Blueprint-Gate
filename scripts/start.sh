@@ -70,6 +70,25 @@ if [[ "$mode" != "--worker-only" ]]; then
     echo "Set a real CONTROL_TOKEN in .env or the environment." >&2
     exit 1
   fi
+  compose_files=()
+  app_key_file="${GITHUB_APP_PRIVATE_KEY_FILE:-$(read_dotenv GITHUB_APP_PRIVATE_KEY_FILE)}"
+  if [[ -n "$app_key_file" ]]; then
+    if [[ ! -f "$app_key_file" ]]; then
+      echo "GitHub App private key file is missing: $app_key_file" >&2
+      exit 1
+    fi
+    export GITHUB_APP_PRIVATE_KEY_FILE="$app_key_file"
+    compose_files=(-f compose.yaml -f compose.github-app.yaml)
+  fi
+  local_tls="${BLUEPRINT_LOCAL_TLS:-$(read_dotenv BLUEPRINT_LOCAL_TLS)}"
+  if [[ "$local_tls" == "true" ]]; then
+    if [[ ! -f compose.local-tls.yaml ]]; then
+      echo "Local TLS overlay is missing: compose.local-tls.yaml" >&2
+      exit 1
+    fi
+    if [[ ${#compose_files[@]} -eq 0 ]]; then compose_files=(-f compose.yaml); fi
+    compose_files+=(-f compose.local-tls.yaml)
+  fi
   if ! command -v docker >/dev/null 2>&1; then
     echo "Docker is not installed or is not on PATH." >&2
     exit 1
@@ -93,7 +112,11 @@ if [[ "$mode" != "--worker-only" ]]; then
   fi
 
   echo "Starting PostgreSQL, control plane, and scheduler..."
-  docker compose up --build -d
+  if [[ ${#compose_files[@]} -eq 0 ]]; then
+    docker compose up --build -d
+  else
+    docker compose "${compose_files[@]}" up --build -d
+  fi
   for _ in {1..60}; do
     if curl --fail --silent --output /dev/null http://127.0.0.1:8000/health; then break; fi
     sleep 2
@@ -118,5 +141,5 @@ if [[ "$mode" == "--control-only" ]]; then exit 0; fi
 
 echo "Starting host worker in this terminal. Press Ctrl-C once to yield its active job safely."
 # The control credential and local control-plane GitHub token are not worker credentials.
-unset CONTROL_TOKEN GITHUB_TOKEN GITHUB_APP_ID GITHUB_INSTALLATION_ID GITHUB_PRIVATE_KEY_PATH GITHUB_APP_PRIVATE_KEY_FILE GITHUB_WEBHOOK_SECRET
+unset CONTROL_TOKEN GITHUB_TOKEN GITHUB_APP_ID GITHUB_INSTALLATION_ID GITHUB_PRIVATE_KEY_PATH GITHUB_APP_PRIVATE_KEY_FILE GITHUB_WEBHOOK_SECRET GITHUB_WEBHOOK_PREVIOUS_SECRET
 exec "$adp" worker --config "$config"
