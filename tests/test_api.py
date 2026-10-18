@@ -7,6 +7,15 @@ from adp import api
 from adp.db import Base, Job, Repository, Ticket
 
 
+def test_equal_admin_and_worker_tokens_fail_closed(monkeypatch):
+    monkeypatch.setattr(api.settings, "control_token", "same-secret")
+    monkeypatch.setattr(api.settings, "worker_token", "same-secret")
+    with TestClient(api.app) as client:
+        admin = {"Authorization": "Bearer same-secret"}
+        assert client.post("/repositories", headers=admin, json={"full_name": "example/project"}).status_code == 503
+        assert client.post("/jobs/claim", headers=admin, json={"worker_id": "w1"}).status_code == 503
+
+
 def test_poll_claim_and_worker_cannot_approve(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)

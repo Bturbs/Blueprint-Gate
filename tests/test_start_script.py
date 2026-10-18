@@ -21,7 +21,11 @@ set -euo pipefail
 case "$1" in
   control-status) [[ "${CONTROL_TOKEN:-}" == admin-secret ]]; printf '{"paused":%s}\\n' "$(cat "$TEST_STATUS")" ;;
   resume) [[ "${CONTROL_TOKEN:-}" == admin-secret ]]; echo false > "$TEST_STATUS"; echo resume >> "$TEST_LOG" ;;
-  worker) [[ "${ADP_WORKER_TOKEN:-}" == worker-secret ]]; echo worker >> "$TEST_LOG" ;;
+  worker)
+    [[ "${ADP_WORKER_TOKEN:-}" == worker-secret ]]
+    if [[ -n "${CONTROL_TOKEN:-}" ]]; then echo admin-leaked >&2; exit 77; fi
+    echo worker >> "$TEST_LOG"
+    ;;
 esac
 """)
     (root / ".venv" / "bin" / "adp").chmod(0o755)
@@ -73,7 +77,7 @@ def test_worker_only_does_not_require_local_docker_or_database(tmp_path):
     status = root / "status"
     status.write_text("false")
     env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}", TEST_STATUS=str(status), TEST_LOG=str(root / "calls"), ADP_WORKER_TOKEN="worker-secret")
-    env.pop("CONTROL_TOKEN", None)
+    env["CONTROL_TOKEN"] = "admin-secret"
     result = subprocess.run([str(script), "--worker-only"], cwd=root, env=env, text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert (root / "calls").read_text().splitlines() == ["worker"]
@@ -85,4 +89,13 @@ def test_resume_checks_worker_config_before_clearing_pause(tmp_path):
     result = _run(script, root, "--resume", paused=True)
     assert result.returncode == 1
     assert "Missing worker config" in result.stderr
+    assert not (root / "calls").exists()
+
+
+def test_start_rejects_reused_admin_and_worker_credential_before_docker(tmp_path):
+    script, root = _fixture(tmp_path)
+    (root / ".env").write_text("CONTROL_TOKEN=same-secret\nWORKER_TOKEN=same-secret\n")
+    result = _run(script, root)
+    assert result.returncode == 1
+    assert "must be different" in result.stderr
     assert not (root / "calls").exists()

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from adp.process_env import child_environment
+
 
 @dataclass
 class RuntimeResult:
@@ -49,7 +51,7 @@ async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int) -> tuple[i
     process = await asyncio.create_subprocess_exec(
         *argv, cwd=cwd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
+        start_new_session=True, env=child_environment("runtime", Path(argv[0]).name),
     )
     try:
         out, err = await asyncio.wait_for(process.communicate(prompt.encode()), timeout)

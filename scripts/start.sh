@@ -70,6 +70,10 @@ if [[ "$mode" != "--worker-only" ]]; then
     echo "Set a real CONTROL_TOKEN in .env or the environment." >&2
     exit 1
   fi
+  if [[ "$mode" == "--local" && "$ADP_WORKER_TOKEN" == "$CONTROL_TOKEN" ]]; then
+    echo "The worker and administrator credentials must be different." >&2
+    exit 1
+  fi
   if ! command -v docker >/dev/null 2>&1; then
     echo "Docker is not installed or is not on PATH." >&2
     exit 1
@@ -116,5 +120,10 @@ fi
 
 if [[ "$mode" == "--control-only" ]]; then exit 0; fi
 
+if [[ -n "${CONTROL_TOKEN:-}" && "${ADP_WORKER_TOKEN:-}" == "$CONTROL_TOKEN" ]]; then
+  echo "The worker and administrator credentials must be different." >&2
+  exit 1
+fi
 echo "Starting host worker in this terminal. Press Ctrl-C once to yield its active job safely."
+unset CONTROL_TOKEN
 exec "$adp" worker --config "$config"

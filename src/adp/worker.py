@@ -16,18 +16,20 @@ import httpx
 import yaml
 
 from adp.runtimes import candidate_runtimes
+from adp.process_env import child_environment
 from adp.threat_models import in_place_controls, reject_unverified_controls, verify
 
 HEARTBEAT_SECONDS = 10
 
 
 def _git(cwd: Path, *args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=True, timeout=120)
+    purpose = "git_push" if args and args[0] == "push" else "git_local"
+    result = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=cwd, text=True, capture_output=True, check=True, timeout=120, env=child_environment(purpose))
     return result.stdout.strip()
 
 
 def _gh(cwd: Path, *args: str) -> str:
-    result = subprocess.run(["gh", *args], cwd=cwd, text=True, capture_output=True, check=True, timeout=120)
+    result = subprocess.run(["gh", *args], cwd=cwd, text=True, capture_output=True, check=True, timeout=120, env=child_environment("delivery"))
     return result.stdout.strip()
 
 
@@ -97,7 +99,7 @@ async def _checks(cwd: Path, commands: list[list[str]]) -> list[dict]:
             raise ValueError("Checks must be argv arrays")
         process = None
         try:
-            process = await asyncio.create_subprocess_exec(*command, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True)
+            process = await asyncio.create_subprocess_exec(*command, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True, env=child_environment("check"))
             out, err = await asyncio.wait_for(process.communicate(), 300)
             results.append({"command": command, "passed": process.returncode == 0, "output": (out + err).decode(errors="replace")[-2000:]})
         except (OSError, asyncio.TimeoutError) as exc:
@@ -316,6 +318,13 @@ async def run_worker(config_path: Path, once: bool = False):
     token = os.environ.get(config.get("worker_token_env", ""), "") if config.get("worker_token_env") else config.get("worker_token", "")
     if not token:
         raise ValueError("Worker token is not configured")
+    if config.get("worker_token_env") == "CONTROL_TOKEN":
+        raise ValueError("Administrator credential cannot be used as a worker token")
+    if os.environ.get("CONTROL_TOKEN") and token == os.environ["CONTROL_TOKEN"]:
+        raise ValueError("Worker and administrator credentials must be different")
+    os.environ.pop("CONTROL_TOKEN", None)
+    if config.get("worker_token_env"):
+        os.environ.pop(config["worker_token_env"], None)
     headers = {"Authorization": f"Bearer {token}"}
     worker_id = config.get("worker_id", "local-worker")
     async with httpx.AsyncClient(base_url=base, headers=headers, timeout=30) as client:
