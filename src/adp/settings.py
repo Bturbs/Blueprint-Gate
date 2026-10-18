@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
 
 
 class Settings(BaseSettings):
@@ -20,6 +21,12 @@ class Settings(BaseSettings):
     worker_id: str = "local-worker"
     threat_tool_root: str = ""
     log_dir: str = "./logs"
+
+    @model_validator(mode="after")
+    def reject_hybrid_personal_token(self):
+        if self.hybrid_mode and self.github_token:
+            raise ValueError("Hybrid control must not have GITHUB_TOKEN in its environment")
+        return self
 
 
 settings = Settings()

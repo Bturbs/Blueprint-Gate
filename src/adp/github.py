@@ -13,13 +13,13 @@ def dependencies(body: str) -> list[int]:
 
 class GitHubClient:
     def __init__(self, token: str | None = None, transport=None):
-        self.token = settings.github_token if token is None else token
+        self.token = token
         self.transport = transport
 
     async def list_issues(self, repo: str) -> list[dict]:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
             raise ValueError("Invalid repository name")
-        token = self.token or await tokens.get()
+        token = await tokens.get(self.token)
         issues: list[dict] = []
         async with httpx.AsyncClient(base_url=settings.github_api_url, transport=self.transport, timeout=30) as client:
             for page in range(1, 101):
