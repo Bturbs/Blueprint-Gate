@@ -113,12 +113,15 @@ def complete_stage(db: Session, ticket: Ticket, stage: str, result: dict) -> Non
         ticket.verification_passed = False
         ticket.threat_revision = None
         ticket.findings = []
-        ticket.artifacts = {k: v for k, v in ticket.artifacts.items() if k not in {"threat_model_pr", "threat_model_pr_approved", "threat_model_pr_merged"}}
+        ticket.artifacts = {k: v for k, v in ticket.artifacts.items() if k not in {"threat_model_pr", "threat_model_pr_approved", "threat_model_pr_merged", "in_place_controls"}}
         ticket.artifacts = {**ticket.artifacts, "design": result["design"], "tasks": result["tasks"]}
         ticket.state = "DESIGN_READY"
     elif stage == "threat_modeler":
         if not result.get("verification_passed") or not result.get("threat_revision"):
             raise ValueError("Root threat-model verification and revision required")
+        controls = result.get("in_place_controls")
+        if ticket.repository.policy.get("evidence_review_required") and (not isinstance(controls, list) or any(not isinstance(control, str) or not control for control in controls) or len(controls) != len(set(controls))):
+            raise ValueError("Verified in-place control manifest required for evidence review")
         validate_findings(ticket, result.get("findings", []))
         validate_mitigations(result.get("mitigation_requirements", []))
         allowed_checks = ticket.repository.policy.get("required_checks", [])
@@ -128,6 +131,8 @@ def complete_stage(db: Session, ticket: Ticket, stage: str, result: dict) -> Non
         ticket.threat_revision = result["threat_revision"]
         ticket.findings = result.get("findings", [])
         ticket.artifacts = {**ticket.artifacts, "mitigation_requirements": result.get("mitigation_requirements", [])}
+        if ticket.repository.policy.get("evidence_review_required"):
+            ticket.artifacts = {**ticket.artifacts, "in_place_controls": controls}
         if ticket.repository.policy.get("threat_model_pr_required"):
             pr = result.get("threat_model_pr")
             if not isinstance(pr, dict) or not all(pr.get(k) for k in ("repository", "number", "head_sha")):

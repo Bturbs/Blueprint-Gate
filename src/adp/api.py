@@ -217,6 +217,10 @@ class PublicationReconcileIn(BaseModel):
 class ApprovalIn(BaseModel):
     actor: str | None = Field(default=None, min_length=2)
     justification: str = Field(min_length=10)
+    reviewed_design_revision: int | None = None
+    reviewed_threat_revision: str | None = None
+    reviewed_boundaries: list[str] | None = None
+    control_evidence: dict[str, str] | None = None
 
 
 class RiskAcceptanceIn(BaseModel):
@@ -338,6 +342,22 @@ def add_repository(data: RepositoryIn, principal: HumanPrincipal | None = Depend
 @app.get("/repositories", dependencies=[Depends(authorized)])
 def list_repositories(db: Session = Depends(db_session)):
     return [{"id": r.id, "full_name": r.full_name, "paused": r.paused, "auto_merge": r.auto_merge, "policy": r.policy} for r in db.scalars(select(Repository))]
+
+
+@app.post("/repositories/{repo_id}/require-evidence-review")
+def require_evidence_review(repo_id: str, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
+    state = db.scalar(select(ControlState).where(ControlState.id == 1).with_for_update())
+    running = db.scalar(select(func.count()).select_from(Job).where(Job.state == "RUNNING")) or 0
+    if not state or not state.paused or running:
+        raise HTTPException(409, "Pause and drain all workers before changing evidence policy")
+    repo = db.scalar(select(Repository).where(Repository.id == repo_id).with_for_update())
+    if not repo:
+        raise HTTPException(404, "Repository not found")
+    if not repo.policy.get("evidence_review_required"):
+        repo.policy = {**repo.policy, "evidence_review_required": True}
+        db.add(AuditEvent(action="evidence_review_required", detail={"repository": repo.full_name, "actor": principal.actor if principal else None}))
+        db.commit()
+    return {"repository": repo.full_name, "evidence_review_required": True}
 
 
 @app.post("/repositories/{repo_id}/control/{action}")
@@ -900,10 +920,29 @@ def approve(ticket_id: str, data: ApprovalIn, principal: HumanPrincipal | None =
     ticket = db.get(Ticket, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
+    review = None
+    if ticket.repository.policy.get("evidence_review_required"):
+        if principal is None:
+            raise HTTPException(409, "Evidence review requires authenticated human identity")
+        if data.reviewed_design_revision != ticket.design_revision or data.reviewed_threat_revision != ticket.threat_revision:
+            raise HTTPException(409, "Review does not match the current design and model revisions")
+        expected = ticket.artifacts.get("in_place_controls")
+        if not isinstance(expected, list) or any(not isinstance(item, str) or not item for item in expected):
+            raise HTTPException(409, "Verified control manifest is missing")
+        boundaries = data.reviewed_boundaries
+        if not boundaries or any(not isinstance(item, str) or len(item.strip()) < 10 for item in boundaries):
+            raise HTTPException(422, "Record the trust boundaries reviewed")
+        evidence = data.control_evidence
+        if evidence is None or set(evidence) != set(expected) or any(not isinstance(ref, str) or len(ref.strip()) < 10 for ref in evidence.values()):
+            raise HTTPException(422, "Provide evidence for every in-place control")
+        review = {"design_revision": ticket.design_revision, "threat_revision": ticket.threat_revision, "boundaries": boundaries, "control_evidence": evidence}
     try:
-        approve_security(db, ticket, _decision_actor(principal, data.actor), data.justification)
+        actor = _decision_actor(principal, data.actor)
+        approve_security(db, ticket, actor, data.justification)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    if review is not None:
+        db.add(AuditEvent(ticket_id=ticket.id, action="security_evidence_reviewed", detail={"actor": actor, **review}))
     db.commit()
     return {"state": ticket.state, "design_revision": ticket.design_revision}
 
