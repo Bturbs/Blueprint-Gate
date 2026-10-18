@@ -17,7 +17,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 worker_home="$HOME"
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
-sudo apt-get install -y -qq acl git gh nodejs npm python3-venv python3-pip >/dev/null
+sudo apt-get install -y -qq acl bubblewrap git gh nodejs npm python3-venv python3-pip >/dev/null
 sudo groupadd -f blueprint-work
 if ! getent passwd blueprint-agent >/dev/null; then
   sudo useradd --create-home --shell /bin/bash blueprint-agent
@@ -80,6 +80,7 @@ config = {
     "worker_id": "local-staging-worker",
     "untrusted_user": "blueprint-agent",
     "untrusted_group": "blueprint-work",
+    "untrusted_sandbox": True,
     "capabilities": ["git", "codex"],
     "poll_seconds": 5,
     "threat_tool_root": "/srv/blueprint-gate/tools/threat-model-tool",
