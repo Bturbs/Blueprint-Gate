@@ -11,6 +11,7 @@ import re
 import subprocess
 from pathlib import Path
 from typing import Awaitable, Callable
+from uuid import uuid4
 
 import httpx
 import yaml
@@ -92,23 +93,65 @@ def _write_specs(cwd: Path, number: int, result: dict, stage: str):
         (directory / names[key]).write_text(value, encoding="utf-8")
 
 
-async def _checks(cwd: Path, commands: list[list[str]]) -> list[dict]:
+async def _check_output_tail(stream: asyncio.StreamReader) -> bytes:
+    tail = b""
+    while chunk := await stream.read(65536):
+        tail = (tail + chunk)[-2000:]
+    return tail
+
+
+async def _remove_check_container(name: str) -> None:
+    try:
+        cleanup = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            env=child_environment("check"),
+        )
+        await asyncio.wait_for(cleanup.wait(), timeout=10)
+    except (OSError, asyncio.TimeoutError):
+        pass
+
+
+def _check_argv(cwd: Path, command: list[str], image: str, name: str) -> list[str]:
+    source = str(cwd.resolve())
+    if any(character in source for character in (",", "\n", "\r")):
+        raise ValueError("Check worktree path cannot be represented safely as a Docker mount")
+    return [
+        "docker", "run", "--rm", "--pull", "never", "--name", name,
+        "--network", "none", "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true", "--user", "65534:65534",
+        "--pids-limit", "128", "--memory", "512m", "--cpus", "1",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+        "--mount", f"type=bind,src={source},dst=/workspace,readonly",
+        "--workdir", "/workspace", "--env", "HOME=/tmp",
+        "--env", "TMPDIR=/tmp", "--env", "XDG_CACHE_HOME=/tmp",
+        "--env", "PYTHONDONTWRITEBYTECODE=1", "--entrypoint", command[0], image,
+        *command[1:],
+    ]
+
+
+async def _checks(cwd: Path, commands: list[list[str]], image: str | None = None) -> list[dict]:
+    if commands and (not isinstance(image, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}", image)):
+        raise ValueError("Worker check_image must be a locally available image pinned by SHA-256 digest")
     results = []
     for command in commands:
         if not command or not all(isinstance(x, str) for x in command):
             raise ValueError("Checks must be argv arrays")
         process = None
+        name = f"blueprint-check-{uuid4().hex}"
+        argv = _check_argv(cwd, command, image, name)
         try:
-            process = await asyncio.create_subprocess_exec(*command, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True, env=child_environment("check"))
-            out, err = await asyncio.wait_for(process.communicate(), 300)
-            results.append({"command": command, "passed": process.returncode == 0, "output": (out + err).decode(errors="replace")[-2000:]})
+            process = await asyncio.create_subprocess_exec(*argv, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True, env=child_environment("check"))
+            out, err, code = await asyncio.wait_for(asyncio.gather(_check_output_tail(process.stdout), _check_output_tail(process.stderr), process.wait()), 300)
+            results.append({"command": command, "passed": code == 0, "output": (out + err).decode(errors="replace")[-2000:]})
         except (OSError, asyncio.TimeoutError) as exc:
             if isinstance(exc, asyncio.TimeoutError):
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                await process.communicate()
+                await process.wait()
+                await _remove_check_container(name)
             results.append({"command": command, "passed": False, "output": str(exc)})
         except asyncio.CancelledError:
             if process:
@@ -116,7 +159,8 @@ async def _checks(cwd: Path, commands: list[list[str]]) -> list[dict]:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                await process.communicate()
+                await process.wait()
+                await _remove_check_container(name)
             raise
     return results
 
@@ -214,7 +258,7 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
                     raise ValueError("Threat-model PR required but no model change or existing PR found")
                 result["threat_model_pr"] = {"repository": tm_full_name, "number": tm_pr, "head_sha": _git(cwd, "rev-parse", "HEAD")}
     if stage in {"engineer", "qa", "security_engineer"}:
-        checks = await _checks(cwd, policy.get("required_checks", []))
+        checks = await _checks(cwd, policy.get("required_checks", []), local.get("check_image"))
         result["checks"] = checks
         if stage == "engineer" and (not checks or not all(c["passed"] for c in checks)):
             raise ValueError("Required validation checks missing or failed")
