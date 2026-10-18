@@ -29,12 +29,19 @@ def db_session():
         yield db
 
 
+def _require_distinct_service_tokens():
+    if settings.control_token and settings.worker_token and hmac.compare_digest(settings.control_token, settings.worker_token):
+        raise HTTPException(503, "Administrator and worker credentials must be different")
+
+
 def authorized(authorization: Annotated[str | None, Header()] = None):
+    _require_distinct_service_tokens()
     if not settings.control_token or not hmac.compare_digest(authorization or "", f"Bearer {settings.control_token}"):
         raise HTTPException(401, "Invalid control token")
 
 
 def worker_authorized(authorization: Annotated[str | None, Header()] = None, db: Session = Depends(db_session)):
+    _require_distinct_service_tokens()
     prefix = "Bearer "
     if not authorization or not authorization.startswith(prefix):
         raise HTTPException(401, "Invalid worker token")

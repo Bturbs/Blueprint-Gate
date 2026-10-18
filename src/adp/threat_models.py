@@ -6,6 +6,8 @@ import signal
 from pathlib import Path
 import yaml
 
+from adp.process_env import child_environment
+
 
 def discover(root: Path) -> list[Path]:
     """Only return conventionally named models; never manufacture a model."""
@@ -50,7 +52,7 @@ async def verify(root_model: Path, tool_root: Path, timeout: int = 120) -> dict:
     process = await asyncio.create_subprocess_exec(
         "npx", "--no-install", "tsx", str(script), str(root_model.resolve()),
         cwd=tool_root, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
+        start_new_session=True, env=child_environment("verify"),
     )
     try:
         out, err = await asyncio.wait_for(process.communicate(), timeout)
