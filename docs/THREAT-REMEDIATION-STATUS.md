@@ -1,8 +1,10 @@
 # Blueprint Gate threat remediation status
 
-Snapshot: 2026-10-18. The [root threat model](https://github.com/Bturbs/Threat-Models/blob/main/threatModels/BlueprintGate/BlueprintGate.yaml) is tracked in [Threat-Models PR #3](https://github.com/Bturbs/Threat-Models/pull/3). Every threat has a `ticketLink`. All 13 issues remain open and `fullyMitigated` remains false; a linked PR or this staging snapshot is not proof of a production control.
+Snapshot: 2026-10-18. [Threat-Models PR #3](https://github.com/Bturbs/Threat-Models/pull/3) merged the 13 issue links into the [root threat model](https://github.com/Bturbs/Threat-Models/blob/main/threatModels/BlueprintGate/BlueprintGate.yaml). All 13 issues remain open and `fullyMitigated` remains false; a linked PR or this staging snapshot is not proof of a production control.
 
 The Mac staging stack runs PostgreSQL, the control API, and a loopback-only local TLS worker proxy. `HYBRID_MODE=true`; global and repository work are paused, there are no running jobs, no GitHub App or personal token is configured, and delivery and automatic merge are disabled. The integrated branch is [draft PR #23](https://github.com/Bturbs/Blueprint-Gate/pull/23); individual PRs remain reviewable below.
+
+Merge gate: Blueprint Gate `main` requires one independent approval, current GitHub Actions checks, and approval of the latest push. The checks on PRs #14–#23 pass, but none has the required approval; the PR author is currently the repository's only collaborator. PR #15 depends on #14, and PR #21 depends on #15. The draft integration PR #23 remains a review packet. No implementation PR has merged, so the model's remaining `inPlace` flags have not been changed.
 
 | Threat issue | Implemented or staged progression | Remaining evidence or work |
 | --- | --- | --- |
@@ -20,4 +22,4 @@ The Mac staging stack runs PostgreSQL, the control API, and a loopback-only loca
 | [#12 Unsafe hybrid transport](https://github.com/Bturbs/Blueprint-Gate/issues/12) | [#19](https://github.com/Bturbs/Blueprint-Gate/pull/19) provides trusted local TLS and hides admin routes. A scoped staging worker completed a synthetic job through it. | Verify a remote worker deployment and its trust/rotation policy if one is introduced. |
 | [#13 Job state loss](https://github.com/Bturbs/Blueprint-Gate/issues/13) | [#16](https://github.com/Bturbs/Blueprint-Gate/pull/16) installs daily backup and weekly separate-database restore checks; both ran successfully on the Mac. | Store an encrypted protected copy off this Mac and test recovery from that copy. |
 
-Verification at this snapshot: integrated Python suite 76 passed, 4 skipped with `HYBRID_MODE=false` for the test process; [root model verifier](https://github.com/Bturbs/Threat-Models/pull/3) passed with 13 threats and 28 countermeasures. The staging service itself remains in hybrid mode. Consult the linked issues for the latest evidence and closure criteria.
+Verification at this snapshot: integrated Python suite 76 passed, 4 skipped with `HYBRID_MODE=false` for the test process; the [root model verifier](https://github.com/Bturbs/Threat-Models/pull/3) passed with 13 threats and 28 countermeasures. The staging service itself remains in hybrid mode. Consult the linked issues for the latest evidence and closure criteria.
