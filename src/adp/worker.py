@@ -17,6 +17,7 @@ import yaml
 
 from adp.runtimes import candidate_runtimes
 from adp.control_url import control_origin
+from adp.isolation import isolated_supervisor
 from adp.threat_models import in_place_controls, reject_unverified_controls, verify
 
 HEARTBEAT_SECONDS = 10
@@ -120,7 +121,13 @@ async def _checks(cwd: Path, commands: list[list[str]]) -> list[dict]:
     return results
 
 
-async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[None]] | None = None) -> dict:
+async def _execute_guest_job(job: dict, config: dict, guard: Callable[[], Awaitable[None]] | None = None) -> dict:
+    """Guest-side workload implementation.
+
+    This function is packaged into the pinned guest image.  The worker host
+    must call :func:`execute_job` instead; it deliberately has no path to this
+    local implementation after an issue is claimed.
+    """
     full_name = job["repository"]["full_name"]
     local = config.get("repositories", {}).get(full_name, {})
     if not local.get("path"):
@@ -261,6 +268,28 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
             if not match:
                 raise ValueError("GitHub did not return a pull request number")
             result["pr_number"] = int(match.group(1))
+    return result
+
+
+async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[None]] | None = None) -> dict:
+    """Run a claimed job through the disposable-VM supervisor.
+
+    ``guard`` is intentionally not sent to the guest.  Claims remain owned by
+    the trusted worker and cancellation tears down the whole guest instead of
+    letting an untrusted descendant continue with stale network grants.
+    """
+    supervisor = isolated_supervisor(config)
+    result: dict | None = None
+    try:
+        if guard:
+            await guard()
+        result = await supervisor.run(job)
+    finally:
+        teardown_verified = await supervisor.teardown()
+        if result and isinstance(result.get("isolation"), dict):
+            result["isolation"]["teardown_verified"] = teardown_verified
+    if result is None:
+        raise RuntimeError("isolated job ended without a result")
     return result
 
 

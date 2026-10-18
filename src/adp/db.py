@@ -68,6 +68,26 @@ class Job(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class IsolationRecord(Base):
+    """Supervisor-produced evidence for one fenced job execution.
+
+    Values here are identifiers and digests only.  Secret values and guest
+    command output deliberately belong neither in this table nor in audit logs.
+    """
+    __tablename__ = "isolation_records"
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
+    boundary_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    policy_digest: Mapped[str] = mapped_column(String(80), nullable=False)
+    guest_image_digest: Mapped[str] = mapped_column(String(80), nullable=False)
+    mount_manifest_digest: Mapped[str] = mapped_column(String(80), nullable=False)
+    egress_profile: Mapped[list] = mapped_column(JSON, default=list)
+    credential_grant_ids: Mapped[list] = mapped_column(JSON, default=list)
+    checkpoint_digest: Mapped[str | None] = mapped_column(String(80))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    teardown_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(30), nullable=False)
+
+
 class Approval(Base):
     __tablename__ = "approvals"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))

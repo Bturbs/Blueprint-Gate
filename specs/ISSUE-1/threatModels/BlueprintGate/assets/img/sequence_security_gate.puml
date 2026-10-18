@@ -1,0 +1,41 @@
+@startuml
+title Blueprint Gate: security gate and delivery
+autonumber
+hide footbox
+skinparam maxMessageSize 120
+
+participant "Host worker" as W #DFF3E3
+participant "Model verifier\n(external tool)" as V #FFF1D6
+participant "GitHub\n(external)" as GH #FFE6DB
+participant "Control plane" as CP #DDEBFF
+database "Decision state" as DB #E8E8FF
+actor "Human reviewer" as H #DFF3E3
+
+W -> V: Root threat-model YAML
+V --> W: Verification outcome + model revision
+opt Separate model PR policy enabled
+  W -> GH: Model commit + pull request
+end
+W -> CP: Findings + verification + model revision
+CP -> DB: Persist findings and design/model revisions
+opt Separate model PR policy enabled
+  CP -> GH: Query model PR head + review/merge state
+  GH --> CP: Head, reviews, merge state
+  CP -> DB: Record exact-head review result
+end
+H -> CP: Security approval + admin token + actor string
+note over H, CP #FFF3CD
+  Code records the supplied actor string; it does not
+  bind that string to an authenticated human identity.
+end note
+CP -> DB: Record approval for current revisions
+W -> CP: Claim engineering job
+CP -> DB: Check verification, findings, review policy, approval
+CP --> W: Engineering job + fence if gate passes
+W -> GH: Push code branch + PR after local checks
+CP -> GH: Query PR head + CI/review state
+GH --> CP: Current head + checks + reviews
+opt Auto-merge enabled; QA/security and policy checks pass
+  CP -> GH: Asynchronous merge request
+end
+@enduml

@@ -12,7 +12,7 @@ The skill is repository scoped. To plan work in another repository, copy `.agent
 
 ## Start locally
 
-Requires Docker, Python 3.12+, Git, GitHub CLI, and at least one authenticated coding CLI. A configured root threat-model YAML and local `corda/threat-model-tool` checkout with `npm install` are required for security design approval.
+Requires Docker, Python 3.12+, and a deployed disposable-VM supervisor. Git, GitHub CLI, provider CLIs, the verifier, and their credentials belong in the pinned guest image, not on the dispatcher. A configured root threat-model YAML and verifier checkout are required in that image for security design approval.
 
 ```bash
 cp .env.example .env
@@ -31,13 +31,13 @@ curl -X POST http://127.0.0.1:8000/repositories \
 .venv/bin/adp poll http://127.0.0.1:8000 "$CONTROL_TOKEN" REPOSITORY_ID
 ```
 
-Copy `worker.example.yaml` to `worker.yaml`, set absolute local paths, export `ADP_WORKER_TOKEN`, then run `.venv/bin/adp worker --config worker.yaml`. This worker uses only outbound HTTP. For a remote control plane, use HTTPS and an issued worker credential. The worker creates `adp/issue-N` worktrees in the configured directory. `delivery_enabled` must be explicitly enabled before it will commit, push, and open an implementation PR.
+Copy `worker.example.yaml` to `worker.yaml`, set the pinned guest image, VM supervisor, egress profile, and stage grant identifiers, then export `ADP_WORKER_TOKEN` and `ADP_VM_SUPERVISOR_TOKEN`. Run `.venv/bin/adp worker --config worker.yaml`. The dispatcher has no local checkout or CLI fallback: it sends a bounded, fenced envelope to the disposable-VM supervisor. See [worker isolation](docs/WORKER_ISOLATION.md). `delivery_enabled` must be explicitly enabled before a guest can commit, push, and open an implementation PR.
 
 After setup, restart the local stack and worker with `./scripts/start.sh`. It reads the local worker token from `.env`, starts Docker Desktop on macOS if needed, waits for the control service, and runs the worker in the foreground. A saved pause remains in force; use `./scripts/start.sh --resume` only when you intend to resume work. Use `./scripts/start.sh --control-only` to start the services without a worker, or `./scripts/start.sh --worker-only` on a hybrid worker host with its scoped token already exported. See [reboot steps](docs/OPERATIONS.md).
 
 ### Stop and resume safely
 
-Press **Ctrl-C once** in a local worker terminal to stop its active CLI, return the unfinished job to the queue, and exit. A normal SIGTERM from a process manager follows the same path. Restart with the same `worker_id` and checkout to pick up the yielded job; another host cannot claim it accidentally. Completed stages remain recorded, and files already written in the issue worktree remain available. An interrupted model response itself starts again, so only completed stages and saved files are durable checkpoints.
+Press **Ctrl-C once** in a dispatcher terminal to revoke the active guest, return the unfinished job to the queue, and exit. A normal SIGTERM from a process manager follows the same path. Restart with the same `worker_id` to pick up the yielded job; another host cannot claim it accidentally. The VM supervisor may restore only its bounded, lineage-checked checkpoint into a new guest. An interrupted model response itself starts again.
 
 To pause the whole system, export the existing `CONTROL_TOKEN` in your shell, then run:
 
@@ -57,7 +57,7 @@ When `allow_risk_acceptance` is explicitly enabled, a human can record a scoped,
 
 To opt a repository into automatic merging, set `auto_merge: true` when registering it and configure nonempty `required_ci_checks`. The control plane compares the PR head with the validated commit and submits GitHub's asynchronous merge request only if all policy checks pass. It records `MERGED` after GitHub confirms the final state. GitHub branch protection must be configured separately. High-risk changed paths require `POST /tickets/{id}/approve-high-risk-merge` after QA and security review; that approval is tied to the exact commit.
 
-CLI subscriptions have limits and are distinct from API billing. This version never falls back to a paid API. Each CLI must be installed and authenticated separately on the worker host. The control plane stores only the selected provider name and reported usage metadata.
+CLI subscriptions have limits and are distinct from API billing. This version never falls back to a paid API. Each CLI must be installed and authenticated separately inside the guest image. The control plane stores only the selected provider name and reported usage metadata.
 
 For hybrid deployment, host the control service behind HTTPS, set `HYBRID_MODE=true`, and issue each worker a scoped credential. Signed GitHub webhooks can trigger faster reconciliation while scheduled polling remains active. See [configuration](docs/CONFIGURATION.md) and [operations](docs/OPERATIONS.md).
 

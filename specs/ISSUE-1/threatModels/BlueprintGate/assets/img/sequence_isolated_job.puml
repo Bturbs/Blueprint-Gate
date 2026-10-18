@@ -1,0 +1,38 @@
+@startuml
+title Proposed isolated issue-job boundary
+participant "Control plane" as CP
+participant "Trusted supervisor" as SUP
+participant "Disposable job guest" as GUEST
+participant "Host egress proxy" as PROXY
+participant "Model provider" as PROVIDER
+participant "GitHub" as GH
+database "Checkpoint store" as STORE
+
+note over CP,SUP
+  Proposed design; no new boundary control is claimed in place.
+  Issue and repository content are untrusted.
+end note
+CP -> SUP: claim + stage + revision + fencing token + issue data
+SUP -> SUP: validate policy, image, empty mounts, and grants
+SUP -> GUEST: authenticated bounded job envelope
+note over SUP,GUEST
+  Trust boundary: guest cannot see supervisor credentials,
+  host files, sibling checkouts, or other worker processes.
+end note
+SUP -> PROXY: grant job and fencing token for selected destinations
+SUP -> GUEST: selected provider and active-repository grants
+GUEST -> PROXY: provider request with job grant
+PROXY -> PROVIDER: approved provider traffic
+GUEST -> PROXY: active-repository GitHub operation
+PROXY -> GH: approved repository traffic
+GUEST -> SUP: untrusted result + checkout revision + checkpoint bytes
+SUP -> SUP: validate schema, size, lineage, and claim fence
+SUP -> STORE: opaque checkpoint + digest + retention deadline
+SUP -> CP: fenced completion + trusted isolation record
+SUP -> PROXY: revoke grant before replacement claim
+SUP -> GUEST: terminate entire VM and descendants
+note over SUP,STORE
+  On retry, restore only into a fresh matching guest;
+  never extract or execute checkpoint data on supervisor.
+end note
+@enduml

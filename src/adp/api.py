@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from adp.db import AuditEvent, ControlState, Job, Repository, RiskAcceptance, SessionLocal, Ticket, WebhookDelivery, WorkerCredential, now
+from adp.db import AuditEvent, ControlState, IsolationRecord, Job, Repository, RiskAcceptance, SessionLocal, Ticket, WebhookDelivery, WorkerCredential, now
 from adp.github import GitHubClient, dependencies
 from adp.merge import GitHubMergeClient
 from adp.projects import GitHubProjectsClient
@@ -423,6 +423,36 @@ def complete(job_id: str, data: CompleteIn, credential: WorkerCredential | None 
     job.provider = data.result.get("provider")
     job.finished_at = now()
     job.lease_expires_at = None
+    isolation = data.result.get("isolation")
+    if isinstance(isolation, dict):
+        required = {"boundary_id", "policy_digest", "guest_image_digest", "mount_manifest_digest", "egress_profile", "credential_grant_ids", "teardown_verified"}
+        if required.issubset(isolation) and isinstance(isolation["egress_profile"], list) and isinstance(isolation["credential_grant_ids"], list):
+            # This record originates with the mutually authenticated supervisor
+            # through its worker credential.  Do not persist arbitrary guest
+            # response fields or values that could be secrets.
+            record = db.get(IsolationRecord, job.id)
+            values = {
+                "boundary_id": str(isolation["boundary_id"])[:128],
+                "policy_digest": str(isolation["policy_digest"])[:80],
+                "guest_image_digest": str(isolation["guest_image_digest"])[:80],
+                "mount_manifest_digest": str(isolation["mount_manifest_digest"])[:80],
+                "egress_profile": [str(x)[:255] for x in isolation["egress_profile"]],
+                "credential_grant_ids": [str(x)[:64] for x in isolation["credential_grant_ids"]],
+                "checkpoint_digest": str(isolation["checkpoint_digest"])[:80] if isolation.get("checkpoint_digest") else None,
+                "teardown_verified": bool(isolation["teardown_verified"]),
+                "outcome": job.state,
+            }
+            started = isolation.get("started_at")
+            if isinstance(started, str):
+                try:
+                    values["started_at"] = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+            if record:
+                for key, value in values.items():
+                    setattr(record, key, value)
+            else:
+                db.add(IsolationRecord(job_id=job.id, **values))
     db.add(AuditEvent(ticket_id=ticket.id, action="job_completed", detail={"job": job.id, "state": job.state}))
     db.commit()
     return {"ticket_state": ticket.state}

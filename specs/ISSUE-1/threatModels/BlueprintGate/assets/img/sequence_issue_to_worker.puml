@@ -1,0 +1,43 @@
+@startuml
+title Blueprint Gate: issue intake and worker context
+autonumber
+hide footbox
+skinparam maxMessageSize 120
+
+participant "GitHub issues\n(external)" as GH #FFE6DB
+participant "Control plane" as CP #DDEBFF
+database "Job state" as DB #E8E8FF
+participant "Host worker" as W #DFF3E3
+collections "Issue worktree" as WT #DFF3E3
+participant "Coding CLI" as CLI #FFF1D6
+participant "Model provider\n(external)" as P #FFE6DB
+
+CP -> GH: Poll issue + project state
+GH --> CP: Issue text + metadata
+note over GH, CP #FFF3CD
+  Issue content crosses into the control plane as untrusted input.
+  A signed webhook is an optional alternate intake path.
+end note
+CP -> DB: Ticket revision + queued stage
+W -> CP: Claim + worker token + capabilities
+note over W, CP #FFF3CD
+  Local: loopback HTTP and shared token.
+  Planned hybrid: HTTPS and scoped worker token.
+  No worker is running yet.
+end note
+CP -> DB: Claim owner + fencing token
+CP --> W: Stage job + issue/design artifacts + fence
+W -> WT: Checkout + saved stage artifacts
+W -> CLI: Stage prompt + selected context
+note over W, CLI #FFF3CD
+  Documented local startup exports the admin token.
+  Child CLI processes inherit the worker environment.
+  Provider receipt of that token is not established.
+end note
+CLI -> P: Prompt + selected work context
+P --> CLI: Model response
+CLI --> W: Generated artifact content
+W -> WT: Save artifacts and changes
+W -> CP: Completion + fence + result
+CP -> DB: Persist result + next stage
+@enduml

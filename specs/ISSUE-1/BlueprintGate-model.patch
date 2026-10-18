@@ -1,0 +1,277 @@
+--- a/threatModels/BlueprintGate/BlueprintGate.yaml
++++ b/threatModels/BlueprintGate/BlueprintGate.yaml
+@@ -16,7 +16,9 @@
+     running. In-place software controls describe implemented code, not a live
+     deployment. Production network, backup, host-isolation, and GitHub
+     branch-protection configurations have not been demonstrated and are not
+-    treated as deployed controls.
++    treated as deployed controls. The proposed per-job guest, egress proxy,
++    credential grants, and checkpoint recovery are design-stage assets; their
++    controls are not treated as implemented or deployed.
+   diagram: |
+     **Issue intake and worker context flow.** The first view follows
+     ISSUE_INTAKE, WORKER_CHANNEL, PROVIDER_PROMPT_FLOW, and the
+@@ -29,6 +31,12 @@
+     UNPROTECTED_MERGE threats. Optional policy branches are labeled.
+ 
+     ![Security gate and delivery sequence](img/sequence_security_gate.svg)
++
++    **Proposed isolated job flow.** The third view follows GUEST_JOB_CHANNEL,
++    JOB_EGRESS, JOB_CHECKPOINT, and the GUEST_EGRESS_BYPASS and
++    GUEST_OUTPUT_BOUNDARY threats. Its boundary controls are proposed.
++
++    ![Proposed isolated job sequence](img/sequence_isolated_job.svg)
+   securityObjectives:
+     - ID: CONFIDENTIALITY
+       title: Confidentiality of credentials and work data
+@@ -79,7 +87,50 @@
+       title: Host worker and coding runtime
+       description: |
+         Claims jobs and executes provider CLIs, checks, Git, and GitHub CLI
+-        operations with its host account's privileges.
++        operations with its host account's privileges. The proposed design
++        divides this role into a trusted supervisor and disposable job guest.
++      inScope: true
++    - ID: ISOLATED_JOB_GUEST
++      type: system
++      title: Disposable issue-job execution guest
++      description: |
++        Proposed per-claim VM that executes the active checkout's coding CLI,
++        Git, GitHub operations, required checks, verifier, and descendants.
++      inScope: true
++    - ID: JOB_EGRESS_PROXY
++      type: system
++      title: Job-scoped outbound policy proxy
++      description: |
++        Proposed host-enforced proxy that mediates guest access to approved
++        provider and repository destinations under a claim fencing token.
++      inScope: true
++    - ID: GUEST_JOB_CHANNEL
++      type: dataflow
++      title: Supervisor-to-guest job and result channel
++      description: |
++        Proposed authenticated private channel carrying a bounded job envelope
++        into the guest and untrusted result data back to the supervisor.
++      inScope: true
++    - ID: JOB_EGRESS
++      type: dataflow
++      title: Guest outbound provider and repository traffic
++      description: |
++        Proposed proxy-mediated connections from one guest to the selected
++        model provider and authorized repository operations.
++      inScope: true
++    - ID: JOB_CHECKPOINT
++      type: data
++      title: Bounded issue-job recovery checkpoint
++      description: |
++        Proposed worktree state and manifest retained for same-ticket recovery
++        and restored only into a new guest with matching lineage.
++      inScope: true
++    - ID: ISOLATION_RECORD
++      type: data
++      title: Supervisor-created job isolation record
++      description: |
++        Proposed trusted record of guest, image, policy, mount, credential-grant,
++        egress, and teardown identity linked to the claimed revision.
+       inScope: true
+     - ID: REPOSITORY_WORKTREE
+       type: data
+@@ -130,6 +181,13 @@
+       description: |
+         Control-plane GitHub token or App private key, and host Git and GitHub
+         CLI credentials used for repository changes and pull requests.
++      inScope: true
++    - ID: JOB_CREDENTIAL_GRANT
++      type: credential
++      title: Temporary provider and repository job grants
++      description: |
++        Proposed guest-only grants for the selected provider and active
++        repository, revoked when the claim ends or loses its fence.
+       inScope: true
+     - ID: ISSUE_INTAKE
+       type: dataflow
+@@ -215,7 +273,12 @@
+   policy options. Provider CLIs are another trust boundary because work
+   context can leave the worker host. Deployment controls and GitHub protection
+   settings require operational validation before their risk can be marked
+-  mitigated.
++  mitigated. The proposed isolation design adds a supervisor-to-guest boundary
++  for untrusted job data and results, a host-enforced guest egress boundary,
++  temporary credentials, and checkpoint transfer into a fresh guest. The
++  supervisor must not trust guest output or import checkpoint content into its
++  own execution context. These controls remain proposed pending deployment
++  and hostile-fixture evidence.
+ threats:
+   - ID: ISSUE_PROMPT_INJECTION
+     title: Issue content redirects a coding worker
+@@ -239,6 +302,10 @@
+       - REFID: ISSUE_INTAKE
+       - REFID: HOST_WORKER
+       - REFID: REPOSITORY_WORKTREE
++      - REFID: ISOLATED_JOB_GUEST
++      - REFID: GUEST_JOB_CHANNEL
++      - REFID: JOB_EGRESS
++      - REFID: JOB_CREDENTIAL_GRANT
+     CVSS:
+       vector: 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H'
+     pentestTestable: true
+@@ -268,6 +335,118 @@
+         public: true
+         operational: true
+         operator: Worker host operator
++      - ID: ENFORCE_DISPOSABLE_GUEST
++        title: Confine every job command to a disposable guest
++        description: |
++          Fail closed unless a pinned guest with no host mounts can run every
++          issue-driven CLI, Git operation, verifier, check, and descendant.
++          Keep supervisor credentials and unrelated checkouts outside it.
++        inPlace: false
++        public: true
++        operational: true
++        operator: Worker host operator
++      - ID: RESTRICT_JOB_CREDENTIALS
++        title: Grant only selected provider and repository credentials
++        description: |
++          Give a guest only the selected provider's credential and a temporary
++          token for the active repository and required role. Keep administrator
++          and worker-control credentials in the trusted supervisor, and revoke
++          grants at claim end or loss.
++        inPlace: false
++        public: true
++        operational: true
++        operator: Worker host operator
++
++  - ID: GUEST_EGRESS_BYPASS
++    title: Untrusted job escapes outbound destination policy
++    attack: |
++      Issue-controlled code or a coding CLI attempts direct network access or
++      uses DNS changes, redirects, alternate ports, or a permitted proxy route
++      to reach an unapproved internet, private-network, or host destination.
++      The current staging provider route is unrestricted; the proposed proxy
++      is not yet implemented or tested across both providers.
++    threatType: Information Disclosure, Elevation of Privilege
++    impactDesc: |
++      The job can transmit repository content or job credentials to an attacker
++      endpoint or reach services outside its authorized repository workflow.
++    impactedSecObj:
++      - REFID: CONFIDENTIALITY
++      - REFID: INTEGRITY
++    attackers:
++      - REFID: ISSUE_AUTHOR
++    assets:
++      - REFID: ISOLATED_JOB_GUEST
++      - REFID: JOB_EGRESS_PROXY
++      - REFID: JOB_EGRESS
++      - REFID: JOB_CREDENTIAL_GRANT
++      - REFID: REPOSITORY_WORKTREE
++    CVSS:
++      vector: 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:L'
++    pentestTestable: true
++    fullyMitigated: false
++    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/1
++    countermeasures:
++      - ID: ENFORCE_FENCED_EGRESS
++        title: Deny direct guest routes and fence approved egress
++        description: |
++          Give guests no direct route. Enforce versioned destination, address,
++          port, DNS, and redirect rules in a host proxy bound to the job and
++          current fencing token. Deny unknown and private destinations and
++          revoke access before a lost claim can be replaced.
++        inPlace: false
++        public: true
++        operational: true
++        operator: Worker host operator
++
++  - ID: GUEST_OUTPUT_BOUNDARY
++    title: Guest result or checkpoint crosses into supervisor authority
++    attack: |
++      Issue-controlled code returns oversized or malformed result data, a
++      forged checkout revision or isolation claim, or checkpoint content with
++      paths, links, or metadata that affect another job. If the supervisor
++      trusts or extracts that content, a guest can cross the intended VM
++      boundary or cause a later claim to resume unauthorized state.
++    threatType: Tampering, Elevation of Privilege, Information Disclosure
++    impactDesc: |
++      A false verification or delivery record can authorize incorrect work;
++      hostile checkpoint import can alter unrelated work or expose supervisor
++      and other-job data.
++    impactedSecObj:
++      - REFID: INTEGRITY
++      - REFID: CONFIDENTIALITY
++      - REFID: AUTHORIZED_DISPATCH
++    attackers:
++      - REFID: ISSUE_AUTHOR
++    assets:
++      - REFID: GUEST_JOB_CHANNEL
++      - REFID: JOB_CHECKPOINT
++      - REFID: ISOLATION_RECORD
++      - REFID: JOB_DATABASE
++      - REFID: REPOSITORY_WORKTREE
++    CVSS:
++      vector: 'CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:C/C:H/I:H/A:H'
++    pentestTestable: true
++    fullyMitigated: false
++    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/1
++    countermeasures:
++      - ID: VALIDATE_GUEST_PROTOCOL
++        title: Validate result data against trusted claim state
++        description: |
++          Authenticate the private channel, bind every message and result to
++          job, repository, stage, revision, and fence, and reject oversized or
++          malformed fields. Derive isolation records in the supervisor rather
++          than accepting guest assertions.
++        inPlace: false
++        public: true
++      - ID: BOUND_CHECKPOINT_RECOVERY
++        title: Restore only bounded same-lineage checkpoint data
++        description: |
++          Limit checkpoint size and retention, verify digest and lineage, and
++          treat the checkpoint as opaque on the supervisor. Restore it only
++          inside a fresh guest, reject unsafe paths and links, and never run
++          checkpoint content in the supervisor context.
++        inPlace: false
++        public: true
+ 
+   - ID: WORKTREE_CODE_EXECUTION
+     title: Repository checks execute hostile code on the worker host
+--- a/threatModels/BlueprintGate/assets/img/sequence_isolated_job.puml
++++ b/threatModels/BlueprintGate/assets/img/sequence_isolated_job.puml
+@@ -0,0 +1,38 @@
++@startuml
++title Proposed isolated issue-job boundary
++participant "Control plane" as CP
++participant "Trusted supervisor" as SUP
++participant "Disposable job guest" as GUEST
++participant "Host egress proxy" as PROXY
++participant "Model provider" as PROVIDER
++participant "GitHub" as GH
++database "Checkpoint store" as STORE
++
++note over CP,SUP
++  Proposed design; no new boundary control is claimed in place.
++  Issue and repository content are untrusted.
++end note
++CP -> SUP: claim + stage + revision + fencing token + issue data
++SUP -> SUP: validate policy, image, empty mounts, and grants
++SUP -> GUEST: authenticated bounded job envelope
++note over SUP,GUEST
++  Trust boundary: guest cannot see supervisor credentials,
++  host files, sibling checkouts, or other worker processes.
++end note
++SUP -> PROXY: grant job and fencing token for selected destinations
++SUP -> GUEST: selected provider and active-repository grants
++GUEST -> PROXY: provider request with job grant
++PROXY -> PROVIDER: approved provider traffic
++GUEST -> PROXY: active-repository GitHub operation
++PROXY -> GH: approved repository traffic
++GUEST -> SUP: untrusted result + checkout revision + checkpoint bytes
++SUP -> SUP: validate schema, size, lineage, and claim fence
++SUP -> STORE: opaque checkpoint + digest + retention deadline
++SUP -> CP: fenced completion + trusted isolation record
++SUP -> PROXY: revoke grant before replacement claim
++SUP -> GUEST: terminate entire VM and descendants
++note over SUP,STORE
++  On retry, restore only into a fresh matching guest;
++  never extract or execute checkpoint data on supervisor.
++end note
++@enduml
