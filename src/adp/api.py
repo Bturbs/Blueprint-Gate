@@ -10,7 +10,8 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from adp.db import AuditEvent, ControlState, Job, Repository, RiskAcceptance, SessionLocal, Ticket, WebhookDelivery, WorkerCredential, now
@@ -608,29 +609,62 @@ async def github_webhook(request: Request, db: Session = Depends(db_session)):
     raw = await request.body()
     if len(raw) > 1024 * 1024:
         raise HTTPException(413, "Webhook payload too large")
-    expected = "sha256=" + hmac.new(settings.github_webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(request.headers.get("x-hub-signature-256", ""), expected):
+    accepted_secrets = [settings.github_webhook_secret]
+    previous_until = settings.github_webhook_previous_until
+    if (settings.github_webhook_previous_secret and previous_until
+            and previous_until.replace(tzinfo=previous_until.tzinfo or timezone.utc) > now()):
+        accepted_secrets.append(settings.github_webhook_previous_secret)
+    signature = request.headers.get("x-hub-signature-256", "")
+    if not any(hmac.compare_digest(signature, "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()) for secret in accepted_secrets):
         raise HTTPException(401, "Invalid webhook signature")
     delivery = request.headers.get("x-github-delivery", "")
     event = request.headers.get("x-github-event", "")
     if not delivery or len(delivery) > 100 or not event:
         raise HTTPException(422, "Missing webhook headers")
-    if db.get(WebhookDelivery, delivery):
-        return {"duplicate": True}
     try:
         payload = json.loads(raw)
     except ValueError as exc:
         raise HTTPException(422, "Invalid JSON payload") from exc
-    if event == "issues":
-        repo_name = (payload.get("repository") or {}).get("full_name")
-        repo = db.scalar(select(Repository).where(Repository.full_name == repo_name)) if repo_name else None
-        if repo:
-            await poll(repo.id, db)
-    elif event == "pull_request":
-        await reconcile_threat_reviews(db)
-        await reconcile_merges(db)
-    elif event == "projects_v2_item":
-        await reconcile_projects(db)
-    db.add(WebhookDelivery(id=delivery, event=event))
-    db.commit()
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "Invalid webhook payload")
+    expected_key = {"issues": "issue", "pull_request": "pull_request", "projects_v2_item": "projects_v2_item"}.get(event)
+    if not expected_key:
+        return {"ignored": True}
+    signed_shapes = {key for key in ("issue", "pull_request", "projects_v2_item") if isinstance(payload.get(key), dict)}
+    if signed_shapes != {expected_key} or not isinstance(payload.get("action"), str):
+        raise HTTPException(422, "Webhook event does not match payload")
+    if event in {"issues", "pull_request"} and ("comment" in payload or "review" in payload):
+        raise HTTPException(422, "Webhook event does not match payload")
+    if event in {"issues", "pull_request"} and not isinstance(payload.get("repository"), dict):
+        raise HTTPException(422, "Webhook repository is missing")
+    # The delivery header is not covered by GitHub's payload signature. The
+    # payload digest also rejects a captured body replayed with a new ID.
+    digest = hashlib.sha256(raw).hexdigest()
+    bind = db.get_bind()
+    # Reconciliation helpers commit or roll back their own Session. Reserve in
+    # a separate transaction so those operations cannot erase dedup evidence.
+    with Session(bind) as reservation:
+        reservation.add(WebhookDelivery(id=delivery, event=event, payload_hash=digest))
+        try:
+            reservation.commit()
+        except IntegrityError:
+            reservation.rollback()
+            return {"duplicate": True}
+    try:
+        if event == "issues":
+            repo_name = (payload.get("repository") or {}).get("full_name")
+            repo = db.scalar(select(Repository).where(Repository.full_name == repo_name)) if repo_name else None
+            if repo:
+                await poll(repo.id, db)
+        elif event == "pull_request":
+            await reconcile_threat_reviews(db)
+            await reconcile_merges(db)
+        elif event == "projects_v2_item":
+            await reconcile_projects(db)
+        db.commit()
+    except Exception:
+        with Session(bind) as reservation:
+            reservation.execute(delete(WebhookDelivery).where(WebhookDelivery.id == delivery, WebhookDelivery.payload_hash == digest))
+            reservation.commit()
+        raise
     return {"accepted": True}
