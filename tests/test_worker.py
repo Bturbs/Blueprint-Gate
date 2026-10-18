@@ -22,6 +22,56 @@ class FakeRuntime:
         return RuntimeResult("codex", "succeeded", json.dumps(output), {})
 
 
+def test_provider_prompt_uses_only_stage_context():
+    sentinel = "UNRELATED_PRIVATE_VALUE"
+    job = {
+        "repository": {"full_name": "example/project", "policy": {"required_checks": [["pytest", "-q"]]}},
+        "ticket": {
+            "number": 5,
+            "title": "Feature",
+            "body": f"Issue-only details {sentinel}",
+            "artifacts": {
+                "requirements": "Required behavior",
+                "design": "Approved design",
+                "tasks": "Implementation tasks",
+                "mitigation_requirements": [{"threat_id": "T1", "countermeasure_id": "C1", "check_command": ["pytest", "-q"]}],
+                "qa_review": {"evidence": "QA feedback", "checks": [{"output": sentinel}]},
+                "security_review": {"evidence": "Security feedback", "checks": [{"output": sentinel}]},
+                "project_item_id": sentinel,
+                "merge_request_uuid": sentinel,
+            },
+            "findings": [{"threat_id": "T1", "note": "Repair boundary"}],
+        },
+    }
+    product_owner = worker._prompt({**job, "stage": "product_owner"})
+    assert "Issue-only details" in product_owner
+    assert "Required behavior" not in product_owner
+    assert "Repair boundary" not in product_owner
+    architect = worker._prompt({**job, "stage": "architect"})
+    assert "Required behavior" in architect
+    assert "Approved design" in architect
+    assert "Implementation tasks" in architect
+    assert "Repair boundary" in architect
+    assert sentinel not in architect
+    engineer = worker._prompt({**job, "stage": "engineer"})
+    assert "Issue-only details" not in engineer
+    assert "Required behavior" in engineer
+    assert "Approved design" in engineer
+    assert "Implementation tasks" in engineer
+    assert "QA feedback" in engineer
+    assert "Security feedback" in engineer
+    assert "Repair boundary" in engineer
+    assert sentinel not in engineer
+    security = worker._prompt({**job, "stage": "security_engineer"})
+    assert "QA feedback" in security
+    assert "Security feedback" in security
+    assert sentinel not in security
+    qa = worker._prompt({**job, "stage": "qa"})
+    assert "QA feedback" in qa
+    assert "Security feedback" in qa
+    assert sentinel not in qa
+
+
 @pytest.mark.asyncio
 async def test_worker_creates_reusable_issue_worktree_and_specs(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
@@ -43,4 +93,3 @@ async def test_worker_creates_reusable_issue_worktree_and_specs(tmp_path, monkey
     assert (spec / "requirements.md").exists()
     assert (spec / "design.md").exists()
     assert (spec / "tasks.md").exists()
-
