@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path]:
-    root = tmp_path / "project"
+    root = tmp_path / "project with spaces"
     (root / "scripts").mkdir(parents=True)
     (root / ".venv" / "bin").mkdir(parents=True)
     (root / "bin").mkdir()

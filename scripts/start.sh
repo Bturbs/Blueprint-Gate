@@ -106,7 +106,7 @@ if [[ "$mode" != "--worker-only" ]]; then
   if [[ "$resume" == true ]]; then
     "$adp" resume http://127.0.0.1:8000
   fi
-  status="$($adp control-status http://127.0.0.1:8000)"
+  status="$("$adp" control-status http://127.0.0.1:8000)"
   if printf '%s' "$status" | "$python" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["paused"] else 1)'; then
     echo "Control plane is still paused. Run 'scripts/start.sh --resume' when ready."
     exit 0
