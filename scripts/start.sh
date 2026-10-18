@@ -54,12 +54,8 @@ if [[ "$mode" != "--control-only" ]]; then
   fi
 fi
 if [[ "$mode" == "--local" ]]; then
-  if [[ -z "${ADP_WORKER_TOKEN:-}" ]]; then
-    ADP_WORKER_TOKEN="$(read_dotenv WORKER_TOKEN)"
-    export ADP_WORKER_TOKEN
-  fi
   if [[ -z "${ADP_WORKER_TOKEN:-}" || "$ADP_WORKER_TOKEN" == replace-with* ]]; then
-    echo "Set a real WORKER_TOKEN in .env or ADP_WORKER_TOKEN in the environment." >&2
+    echo "Export an issued scoped token as ADP_WORKER_TOKEN before starting the worker." >&2
     exit 1
   fi
 fi

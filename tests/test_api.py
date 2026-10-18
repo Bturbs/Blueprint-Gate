@@ -1,10 +1,17 @@
 from fastapi.testclient import TestClient
+from datetime import timedelta
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from adp import api
-from adp.db import Base, Job, Repository, Ticket
+from adp.db import Base, Job, Repository, Ticket, now
+
+
+def worker_auth(client, worker_id):
+    response = client.post("/workers/credentials", headers={"Authorization": "Bearer admin"}, json={"worker_id": worker_id, "repositories": ["example/project"], "capabilities": ["git"], "expires_at": (now() + timedelta(days=7)).isoformat()})
+    response.raise_for_status()
+    return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
 def test_equal_admin_and_worker_tokens_fail_closed(monkeypatch):
@@ -34,9 +41,9 @@ def test_poll_claim_and_worker_cannot_approve(monkeypatch):
     try:
         with TestClient(api.app) as client:
             admin = {"Authorization": "Bearer admin"}
-            worker = {"Authorization": "Bearer worker"}
             response = client.post("/repositories", headers=admin, json={"full_name": "example/project"})
             assert response.status_code == 200
+            worker = worker_auth(client, "w1")
             repo_id = response.json()["id"]
             assert client.post(f"/repositories/{repo_id}/poll", headers=admin).json() == {"discovered": 1, "created": 1, "replanned": 0}
             assert client.post(f"/repositories/{repo_id}/poll", headers=admin).json() == {"discovered": 1, "created": 0, "replanned": 0}
@@ -76,8 +83,8 @@ def test_issue_edit_invalidates_running_job(monkeypatch):
     try:
         with TestClient(api.app) as client:
             admin = {"Authorization": "Bearer admin"}
-            worker = {"Authorization": "Bearer worker"}
             repo_id = client.post("/repositories", headers=admin, json={"full_name": "example/project"}).json()["id"]
+            worker = worker_auth(client, "w")
             client.post(f"/repositories/{repo_id}/poll", headers=admin).raise_for_status()
             claim = client.post("/jobs/claim", headers=worker, json={"worker_id": "w"}).json()
             issue["body"] = "revised acceptance criteria"

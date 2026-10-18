@@ -160,6 +160,14 @@ async def test_direct_worker_rejects_admin_token_reused_as_worker_token(tmp_path
         await worker.run_worker(config, once=True)
 
 
+@pytest.mark.asyncio
+async def test_direct_worker_rejects_inline_token(tmp_path):
+    config = tmp_path / "worker.yaml"
+    config.write_text("control_url: http://127.0.0.1:8000\nworker_token: file-secret\n")
+    with pytest.raises(ValueError, match="worker_token_env"):
+        await worker.run_worker(config, once=True)
+
+
 def test_authenticated_proxy_credentials_are_not_inherited_by_untrusted_commands(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "https://person:proxy-secret@proxy.example:8443")
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
