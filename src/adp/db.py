@@ -126,6 +126,7 @@ class WebhookDelivery(Base):
     __tablename__ = "webhook_deliveries"
     id: Mapped[str] = mapped_column(String(100), primary_key=True)
     event: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
