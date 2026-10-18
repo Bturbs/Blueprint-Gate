@@ -6,6 +6,7 @@ import hashlib
 import json
 import secrets
 import httpx
+from urllib.parse import urlsplit
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -34,6 +35,16 @@ class WorkerPrincipal:
     token_hash: str
     repositories: tuple[str, ...]
     capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class HumanPrincipal:
+    github_id: int
+    login: str
+
+    @property
+    def actor(self) -> str:
+        return f"github:{self.github_id}:{self.login}"
 
 
 def db_session():
@@ -79,6 +90,67 @@ def authorized(authorization: Annotated[str | None, Header()] = None):
     _require_distinct_service_tokens()
     if not settings.control_token or not hmac.compare_digest(authorization or "", f"Bearer {settings.control_token}"):
         raise HTTPException(401, "Invalid control token")
+
+
+def human_authenticated(
+    human_authorization: Annotated[str | None, Header(alias="X-Human-Authorization")] = None,
+    _control: None = Depends(authorized),
+) -> HumanPrincipal | None:
+    if not settings.human_identity_required:
+        return None
+    if not settings.human_reviewer_ids.strip() or not settings.human_operator_ids.strip():
+        raise HTTPException(503, "Human role IDs are not configured")
+    prefix = "Bearer "
+    if not human_authorization or not human_authorization.startswith(prefix):
+        raise HTTPException(401, "Authenticated human token required")
+    token = human_authorization[len(prefix):]
+    if not token or hmac.compare_digest(token, settings.control_token):
+        raise HTTPException(401, "Invalid human token")
+    base = settings.github_api_url.rstrip("/")
+    parsed = urlsplit(base)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise HTTPException(503, "GitHub identity API must use HTTPS")
+    try:
+        response = httpx.get(f"{base}/user", headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}, timeout=5, follow_redirects=False)
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, "GitHub identity check unavailable") from exc
+    if response.status_code in {401, 403}:
+        raise HTTPException(401, "Invalid human token")
+    if response.status_code != 200:
+        raise HTTPException(503, "GitHub identity check unavailable")
+    try:
+        user = response.json()
+        github_id = int(user["id"])
+        login = user["login"]
+        if github_id <= 0 or not isinstance(login, str) or not login:
+            raise ValueError
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(503, "Invalid GitHub identity response") from exc
+    return HumanPrincipal(github_id, login)
+
+
+def _human_role(principal: HumanPrincipal | None, allowed: str) -> HumanPrincipal | None:
+    if principal is not None and str(principal.github_id) not in {item.strip() for item in allowed.split(",") if item.strip()}:
+        raise HTTPException(403, "Human role not permitted")
+    return principal
+
+
+def human_reviewer(principal: HumanPrincipal | None = Depends(human_authenticated)) -> HumanPrincipal | None:
+    return _human_role(principal, settings.human_reviewer_ids)
+
+
+def human_operator(principal: HumanPrincipal | None = Depends(human_authenticated)) -> HumanPrincipal | None:
+    return _human_role(principal, settings.human_operator_ids)
+
+
+def _decision_actor(principal: HumanPrincipal | None, claimed: str | None) -> str:
+    if principal is None:
+        if not claimed or len(claimed) < 2:
+            raise HTTPException(422, "Actor is required")
+        return claimed
+    if claimed and claimed not in {principal.login, principal.actor}:
+        raise HTTPException(403, "Actor does not match authenticated human")
+    return principal.actor
 
 
 def worker_authorized(authorization: Annotated[str | None, Header()] = None, db: Session = Depends(db_session)):
@@ -143,13 +215,13 @@ class PublicationReconcileIn(BaseModel):
 
 
 class ApprovalIn(BaseModel):
-    actor: str = Field(min_length=2)
+    actor: str | None = Field(default=None, min_length=2)
     justification: str = Field(min_length=10)
 
 
 class RiskAcceptanceIn(BaseModel):
     threat_id: str = Field(min_length=1)
-    actor: str = Field(min_length=2)
+    actor: str | None = Field(default=None, min_length=2)
     justification: str = Field(min_length=10)
     residual_risk: str = Field(min_length=10)
     scope: str = Field(min_length=3)
@@ -175,8 +247,8 @@ def _worker_expiry(expiry: datetime) -> datetime:
     return expiry
 
 
-@app.post("/workers/credentials", dependencies=[Depends(authorized)])
-def issue_worker_credential(data: WorkerCredentialIn, db: Session = Depends(db_session)):
+@app.post("/workers/credentials")
+def issue_worker_credential(data: WorkerCredentialIn, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     if db.scalar(select(WorkerCredential).where(WorkerCredential.worker_id == data.worker_id)):
         raise HTTPException(409, "Worker ID already exists")
     known = {x.full_name for x in db.scalars(select(Repository))}
@@ -186,13 +258,13 @@ def issue_worker_credential(data: WorkerCredentialIn, db: Session = Depends(db_s
     expiry = _worker_expiry(data.expires_at)
     credential = WorkerCredential(worker_id=data.worker_id, token_hash=hashlib.sha256(raw.encode()).hexdigest(), repositories=sorted(set(data.repositories)), capabilities=sorted(set(data.capabilities)), expires_at=expiry)
     db.add(credential)
-    db.add(AuditEvent(action="worker_credential_issued", detail={"worker_id": data.worker_id, "repositories": credential.repositories}))
+    db.add(AuditEvent(action="worker_credential_issued", detail={"worker_id": data.worker_id, "repositories": credential.repositories, "actor": principal.actor if principal else None}))
     db.commit()
     return {"id": credential.id, "worker_id": credential.worker_id, "token": raw, "expires_at": expiry}
 
 
-@app.post("/workers/credentials/{credential_id}/rotate", dependencies=[Depends(authorized)])
-def rotate_worker_credential(credential_id: str, data: WorkerCredentialRotateIn, db: Session = Depends(db_session)):
+@app.post("/workers/credentials/{credential_id}/rotate")
+def rotate_worker_credential(credential_id: str, data: WorkerCredentialRotateIn, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     credential = db.scalar(select(WorkerCredential).where(WorkerCredential.id == credential_id).with_for_update())
     if not credential:
         raise HTTPException(404, "Worker credential not found")
@@ -207,18 +279,18 @@ def rotate_worker_credential(credential_id: str, data: WorkerCredentialRotateIn,
     credential.token_hash = hashlib.sha256(raw.encode()).hexdigest()
     credential.expires_at = expiry
     credential.disabled = False
-    db.add(AuditEvent(action="worker_credential_rotated", detail={"worker_id": credential.worker_id, "credential_id": credential.id, "expires_at": expiry.isoformat()}))
+    db.add(AuditEvent(action="worker_credential_rotated", detail={"worker_id": credential.worker_id, "credential_id": credential.id, "expires_at": expiry.isoformat(), "actor": principal.actor if principal else None}))
     db.commit()
     return {"id": credential.id, "worker_id": credential.worker_id, "token": raw, "expires_at": expiry}
 
 
-@app.post("/workers/credentials/{credential_id}/revoke", dependencies=[Depends(authorized)])
-def revoke_worker_credential(credential_id: str, db: Session = Depends(db_session)):
+@app.post("/workers/credentials/{credential_id}/revoke")
+def revoke_worker_credential(credential_id: str, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     credential = db.scalar(select(WorkerCredential).where(WorkerCredential.id == credential_id).with_for_update())
     if not credential:
         raise HTTPException(404, "Worker credential not found")
     credential.disabled = True
-    db.add(AuditEvent(action="worker_credential_revoked", detail={"worker_id": credential.worker_id}))
+    db.add(AuditEvent(action="worker_credential_revoked", detail={"worker_id": credential.worker_id, "actor": principal.actor if principal else None}))
     db.commit()
     return {"revoked": True}
 
@@ -235,8 +307,8 @@ def control_state(db: Session = Depends(db_session)):
     return {"paused": state.paused if state else False, "running_jobs": running}
 
 
-@app.post("/control/{action}", dependencies=[Depends(authorized)])
-def set_control_state(action: str, db: Session = Depends(db_session)):
+@app.post("/control/{action}")
+def set_control_state(action: str, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     if action not in {"pause", "resume"}:
         raise HTTPException(404, "Unknown action")
     state = db.scalar(select(ControlState).where(ControlState.id == 1).with_for_update())
@@ -244,19 +316,21 @@ def set_control_state(action: str, db: Session = Depends(db_session)):
         state = ControlState(id=1, paused=False)
         db.add(state)
     state.paused = action == "pause"
-    db.add(AuditEvent(action="global_pause_changed", detail={"paused": state.paused}))
+    db.add(AuditEvent(action="global_pause_changed", detail={"paused": state.paused, "actor": principal.actor if principal else None}))
     db.commit()
     running = db.scalar(select(func.count()).select_from(Job).where(Job.state == "RUNNING")) or 0
     return {"paused": state.paused, "running_jobs": running}
 
 
-@app.post("/repositories", dependencies=[Depends(authorized)])
-def add_repository(data: RepositoryIn, db: Session = Depends(db_session)):
+@app.post("/repositories")
+def add_repository(data: RepositoryIn, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     existing = db.scalar(select(Repository).where(Repository.full_name == data.full_name))
     if existing:
         raise HTTPException(409, "Repository already exists")
     repo = Repository(full_name=data.full_name, policy=data.policy, auto_merge=data.auto_merge)
     db.add(repo)
+    policy_hash = hashlib.sha256(json.dumps(repo.policy, sort_keys=True).encode()).hexdigest()
+    db.add(AuditEvent(action="repository_registered", detail={"repository": repo.full_name, "policy_sha256": policy_hash, "auto_merge": repo.auto_merge, "actor": principal.actor if principal else None}))
     db.commit()
     return {"id": repo.id, "full_name": repo.full_name}
 
@@ -266,15 +340,15 @@ def list_repositories(db: Session = Depends(db_session)):
     return [{"id": r.id, "full_name": r.full_name, "paused": r.paused, "auto_merge": r.auto_merge, "policy": r.policy} for r in db.scalars(select(Repository))]
 
 
-@app.post("/repositories/{repo_id}/control/{action}", dependencies=[Depends(authorized)])
-def set_repository_state(repo_id: str, action: str, db: Session = Depends(db_session)):
+@app.post("/repositories/{repo_id}/control/{action}")
+def set_repository_state(repo_id: str, action: str, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     if action not in {"pause", "resume"}:
         raise HTTPException(404, "Unknown action")
     repo = db.get(Repository, repo_id)
     if not repo:
         raise HTTPException(404, "Repository not found")
     repo.paused = action == "pause"
-    db.add(AuditEvent(action="repository_pause_changed", detail={"repository": repo.full_name, "paused": repo.paused}))
+    db.add(AuditEvent(action="repository_pause_changed", detail={"repository": repo.full_name, "paused": repo.paused, "actor": principal.actor if principal else None}))
     db.commit()
     running = db.scalar(select(func.count()).select_from(Job).join(Ticket, Ticket.id == Job.ticket_id).where(Job.state == "RUNNING", Ticket.repository_id == repo_id)) or 0
     global_state = db.get(ControlState, 1)
@@ -551,8 +625,8 @@ async def inspect_reconciled_publications(db: Session = Depends(db_session)):
     return results
 
 
-@app.post("/publication-attempts/{attempt_id}/resolve-late", dependencies=[Depends(authorized)])
-async def resolve_late_publication(attempt_id: str, data: PublicationReconcileIn, db: Session = Depends(db_session)):
+@app.post("/publication-attempts/{attempt_id}/resolve-late")
+async def resolve_late_publication(attempt_id: str, data: PublicationReconcileIn, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     if not data.worker_isolation_reset:
         raise HTTPException(422, "Confirm the old worker isolation environment was reset")
     global_state = db.get(ControlState, 1)
@@ -603,13 +677,13 @@ async def resolve_late_publication(attempt_id: str, data: PublicationReconcileIn
         enqueue(db, ticket, "product_owner")
         next_state = "NEEDS_REPLAN"
     ticket.state = next_state
-    db.add(AuditEvent(ticket_id=ticket.id, action="late_publication_resolved", detail={"attempt": attempt.id, "remote_evidence": evidence, "worker_isolation_reset": True, "explanation": data.explanation, "next_state": next_state}))
+    db.add(AuditEvent(ticket_id=ticket.id, action="late_publication_resolved", detail={"attempt": attempt.id, "remote_evidence": evidence, "worker_isolation_reset": True, "explanation": data.explanation, "next_state": next_state, "actor": principal.actor if principal else None}))
     db.commit()
     return {"ticket_state": next_state, "repository_paused": ticket.repository.paused}
 
 
-@app.post("/jobs/{job_id}/reconcile-publication", dependencies=[Depends(authorized)])
-async def reconcile_publication(job_id: str, data: PublicationReconcileIn, db: Session = Depends(db_session)):
+@app.post("/jobs/{job_id}/reconcile-publication")
+async def reconcile_publication(job_id: str, data: PublicationReconcileIn, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     if not data.worker_isolation_reset:
         raise HTTPException(422, "Confirm the old worker isolation environment was reset")
     global_state = db.scalar(select(ControlState).where(ControlState.id == 1).with_for_update())
@@ -674,7 +748,7 @@ async def reconcile_publication(job_id: str, data: PublicationReconcileIn, db: S
     else:
         job.state = "QUEUED"
         ticket.state = original_state
-    db.add(AuditEvent(ticket_id=ticket.id, action="publication_reconciled", detail={"job": job.id, "old_intent": intent, "remote_evidence": evidence, "worker_isolation_reset": True, "explanation": data.explanation, "next_state": ticket.state}))
+    db.add(AuditEvent(ticket_id=ticket.id, action="publication_reconciled", detail={"job": job.id, "old_intent": intent, "remote_evidence": evidence, "worker_isolation_reset": True, "explanation": data.explanation, "next_state": ticket.state, "actor": principal.actor if principal else None}))
     db.commit()
     return {"job_state": job.state, "ticket_state": ticket.state, "remote_evidence": evidence}
 
@@ -741,15 +815,15 @@ def yield_job(job_id: str, data: YieldIn, credential: WorkerPrincipal = Depends(
     return {"queued": job.state == "QUEUED", "publication_review": job.state == "PUBLICATION_REVIEW", "job_id": job.id}
 
 
-@app.post("/jobs/{job_id}/release-affinity", dependencies=[Depends(authorized)])
-def release_job_affinity(job_id: str, db: Session = Depends(db_session)):
+@app.post("/jobs/{job_id}/release-affinity")
+def release_job_affinity(job_id: str, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     job = db.scalar(select(Job).where(Job.id == job_id).with_for_update().execution_options(populate_existing=True))
     if not job or job.state != "QUEUED" or not job.claimed_by:
         raise HTTPException(409, "Job is not a yielded claim")
     previous_worker = job.claimed_by
     job.claimed_by = None
     job.fencing_token += 1
-    db.add(AuditEvent(ticket_id=job.ticket_id, action="job_affinity_released", detail={"job": job.id, "previous_worker": previous_worker}))
+    db.add(AuditEvent(ticket_id=job.ticket_id, action="job_affinity_released", detail={"job": job.id, "previous_worker": previous_worker, "actor": principal.actor if principal else None}))
     db.commit()
     return {"queued": True, "job_id": job.id, "previous_worker": previous_worker}
 
@@ -799,8 +873,8 @@ def complete(job_id: str, data: CompleteIn, credential: WorkerPrincipal = Depend
     return {"ticket_state": ticket.state}
 
 
-@app.post("/jobs/{job_id}/retry", dependencies=[Depends(authorized)])
-def retry_failed_job(job_id: str, db: Session = Depends(db_session)):
+@app.post("/jobs/{job_id}/retry")
+def retry_failed_job(job_id: str, principal: HumanPrincipal | None = Depends(human_operator), db: Session = Depends(db_session)):
     job = db.get(Job, job_id)
     if not job or job.state != "FAILED":
         raise HTTPException(409, "Job is not failed")
@@ -821,21 +895,21 @@ def retry_failed_job(job_id: str, db: Session = Depends(db_session)):
     return {"job_id": queued.id, "revision": queued.revision}
 
 
-@app.post("/tickets/{ticket_id}/approve-security", dependencies=[Depends(authorized)])
-def approve(ticket_id: str, data: ApprovalIn, db: Session = Depends(db_session)):
+@app.post("/tickets/{ticket_id}/approve-security")
+def approve(ticket_id: str, data: ApprovalIn, principal: HumanPrincipal | None = Depends(human_reviewer), db: Session = Depends(db_session)):
     ticket = db.get(Ticket, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
     try:
-        approve_security(db, ticket, data.actor, data.justification)
+        approve_security(db, ticket, _decision_actor(principal, data.actor), data.justification)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     db.commit()
     return {"state": ticket.state, "design_revision": ticket.design_revision}
 
 
-@app.post("/tickets/{ticket_id}/accept-risk", dependencies=[Depends(authorized)])
-def accept_risk(ticket_id: str, data: RiskAcceptanceIn, db: Session = Depends(db_session)):
+@app.post("/tickets/{ticket_id}/accept-risk")
+def accept_risk(ticket_id: str, data: RiskAcceptanceIn, principal: HumanPrincipal | None = Depends(human_reviewer), db: Session = Depends(db_session)):
     ticket = db.get(Ticket, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
@@ -846,28 +920,31 @@ def accept_risk(ticket_id: str, data: RiskAcceptanceIn, db: Session = Depends(db
         raise HTTPException(422, "Expiry must be in the future")
     if data.threat_id not in {f.get("threat_id") for f in ticket.findings if f.get("status") == "open"}:
         raise HTTPException(404, "Open threat finding not found")
+    actor = _decision_actor(principal, data.actor)
     db.add(RiskAcceptance(
         ticket_id=ticket.id, threat_id=data.threat_id, design_revision=ticket.design_revision,
-        threat_revision=ticket.threat_revision, actor=data.actor, justification=data.justification,
+        threat_revision=ticket.threat_revision, actor=actor, justification=data.justification,
         residual_risk=data.residual_risk, scope=data.scope, expires_at=expiry,
     ))
     db.flush()
     if not unresolved_blockers(ticket, db):
         ticket.state = "WAITING_THREAT_PR" if ticket.repository.policy.get("threat_model_pr_required") and not ticket.artifacts.get("threat_model_pr_approved") else "WAITING_SECURITY_APPROVAL"
-    db.add(AuditEvent(ticket_id=ticket.id, action="risk_accepted", detail={"threat_id": data.threat_id, "actor": data.actor, "expiry": expiry.isoformat()}))
+    db.add(AuditEvent(ticket_id=ticket.id, action="risk_accepted", detail={"threat_id": data.threat_id, "actor": actor, "expiry": expiry.isoformat()}))
     db.commit()
     return {"state": ticket.state, "threat_id": data.threat_id, "expires_at": expiry}
 
 
-@app.post("/tickets/{ticket_id}/approve-high-risk-merge", dependencies=[Depends(authorized)])
-def approve_high_risk(ticket_id: str, data: ApprovalIn, db: Session = Depends(db_session)):
+@app.post("/tickets/{ticket_id}/approve-high-risk-merge")
+def approve_high_risk(ticket_id: str, data: ApprovalIn, principal: HumanPrincipal | None = Depends(human_reviewer), db: Session = Depends(db_session)):
     from adp.db import Approval
     ticket = db.get(Ticket, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
     if ticket.state != "READY_TO_MERGE" or not ticket.artifacts.get("commit_sha") or not ticket.pr_number:
         raise HTTPException(409, "PR and independent reviews must be complete before approval")
-    db.add(Approval(ticket_id=ticket.id, kind="high_risk_merge", revision=ticket.design_revision, ref=ticket.artifacts["commit_sha"], actor=data.actor, justification=data.justification))
+    actor = _decision_actor(principal, data.actor)
+    db.add(Approval(ticket_id=ticket.id, kind="high_risk_merge", revision=ticket.design_revision, ref=ticket.artifacts["commit_sha"], actor=actor, justification=data.justification))
+    db.add(AuditEvent(ticket_id=ticket.id, action="high_risk_merge_approved", detail={"actor": actor, "sha": ticket.artifacts["commit_sha"]}))
     db.commit()
     return {"approved": True}
 
