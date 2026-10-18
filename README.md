@@ -1,6 +1,14 @@
-# Autonomous Development Platform
+# Blueprint Gate
 
-Local-first, policy-gated GitHub issue delivery. It runs a FastAPI/PostgreSQL control plane in Docker and Codex or Claude Code workers on the host. It supports GitHub Projects, separate threat-model PRs, asynchronous merge requests, and scoped outbound hybrid workers. See [implementation status and validation limits](docs/IMPLEMENTATION_PLAN.md).
+Blueprint Gate turns GitHub issues into policy-gated software delivery. It runs a FastAPI/PostgreSQL control plane in Docker and Codex or Claude Code workers on the host. It supports GitHub Projects, separate threat-model PRs, asynchronous merge requests, and scoped outbound hybrid workers. See [implementation status and validation limits](docs/IMPLEMENTATION_PLAN.md).
+
+## Plan work with one skill
+
+In Codex chat, use `$github-spec-workflow` and describe what you want to build. The skill reviews current GitHub tickets, discusses overlaps and missing decisions, updates tickets that already cover the idea, and creates tickets for new aspects. You can use the same skill later to refine `specs/ISSUE-N/{requirements,design,tasks}.md` for manual work and prepare a PR handoff. For example: “Use `$github-spec-workflow` for Bturbs/Blueprint-Gate. I want to build ... Review the tickets and update the backlog.” See the [workflow guide](docs/SPEC_WORKFLOW.md) and [skill instructions](.agents/skills/github-spec-workflow/SKILL.md).
+
+The skill runs in a human-driven Codex session using the host's authenticated GitHub CLI. The automated worker still uses its role profiles and security gate. If the target repository is registered with the control plane, the next poll can queue a new issue's Product Owner stage; editing an unmerged issue invalidates prior design approval and queues replanning. If repository policy filters intake by a GitHub Project, add new issues to that Project before expecting the worker to ingest them.
+
+The skill is repository scoped. To plan work in another repository, copy `.agents/skills/github-spec-workflow` into that checkout's `.agents/skills/` and add an equivalent trigger to its `AGENTS.md`. Keep the `gh` login on the host; do not put tokens in prompts or committed files.
 
 ## Start locally
 
@@ -44,4 +52,4 @@ uv sync --extra test --no-editable
 
 After changing source code, rebuild the non-editable local package before running the installed `adp` CLI: `uv sync --extra test --no-editable --reinstall-package autonomous-dev-platform`.
 
-No live GitHub or Claude execution was performed during repository development. A read-only Codex CLI smoke test succeeded; the tests use mocks and local fixtures. Do not point the worker at a production repository until you have reviewed its policy, isolation, GitHub permissions, branch protection, and required checks. See [validation evidence](docs/VALIDATION.md).
+No live GitHub writes or Claude execution were performed during repository development. GitHub repository lookup and issue listing were read-only; a read-only Codex CLI smoke test succeeded. The automated tests use mocks and local fixtures. Do not point the worker at a production repository until you have reviewed its policy, isolation, GitHub permissions, branch protection, and required checks. See [validation evidence](docs/VALIDATION.md).

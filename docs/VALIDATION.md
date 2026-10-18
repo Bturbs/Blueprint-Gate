@@ -9,5 +9,6 @@ Checked on 2026-10-18:
 - `corda/threat-model-tool` was installed in a temporary checkout. Its `init` script created a schema-version-2 fixture; `adp.threat_models.verify` invoked the real `verify-threat-model.ts` script and received a success result.
 - Claude Code is not installed locally. Its adapter follows the [official Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference), but has not been exercised against a real CLI or subscription.
 - GitHub issue polling, Projects V2 GraphQL, GitHub App JWT/token cache, signed webhooks, threat PR review, and asynchronous merge submission were tested with mocks. They have not been run against a dedicated test repository.
+- The single `.agents/skills/github-spec-workflow` skill passed the Codex skill validator. `gh repo view` resolved `Bturbs/Blueprint-Gate`, and a read-only `gh issue list --state all` returned no issues. No live issue edits, issue creation, or Project membership changes were exercised.
 
 Separate threat-model repository Git operations, real GitHub App/Projects/merge queue, remote workers, and Claude execution remain unverified in a live environment. The worker's host-level execution isolation and production backup/monitoring are deployment responsibilities.

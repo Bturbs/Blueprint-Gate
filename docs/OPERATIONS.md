@@ -6,6 +6,8 @@ For local mode, set `.env` then run `docker compose up --build -d`. Use `docker 
 
 For hybrid mode, terminate HTTPS at a trusted reverse proxy, set `HYBRID_MODE=true`, configure a GitHub App installation and webhook secret, then issue a distinct worker credential for each worker. Workers connect outbound to the HTTPS URL. The scheduler keeps GitHub state reconciled and jobs queued while workers are offline.
 
+For backlog planning, run `$github-spec-workflow` from a Codex session in the target checkout. The skill reads existing issues before writing and uses that host's `gh` login. Check the proposed ticket map in chat. If the repository is already registered, a new visible issue is picked up on the next poll. Editing an unmerged issue cancels queued/running work, clears its security design approval, and starts requirements replanning. If the repository uses `project_id`, confirm new issues are in the Project; an issue outside it will not be ingested.
+
 ## Pause and recover
 
 Use `POST /control/pause` or `POST /repositories/{id}/control/pause` with the admin token to stop new claims and merges. Inspect `GET /tickets/{id}` before retrying a failed job through `POST /jobs/{id}/retry`. Retry limits are configured by `max_job_attempts`. A stale worker lease is fenced by a new claim; the old worker cannot complete its job. If an asynchronous merge reaches `MERGE_FAILED` or `MERGE_UNKNOWN`, inspect GitHub and the PR before taking further action.

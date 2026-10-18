@@ -4,6 +4,7 @@
 2. **Delivery:** Opt-in merge eligibility checks validated head, issue link, CI, path policy, and risk approval. GitHub's asynchronous merge API preserves merge-queue behavior and reconciles eventual merged state. Failed jobs have bounded manual retries.
 3. **Threat models:** The verifier adapter checks a configured root YAML. Separate repository worktrees and PRs are supported. An exact-head independent review and merged threat-model PR are required before engineering when policy enables this. Human risk acceptance records are revision-bound and expiring.
 4. **Hybrid:** Outbound HTTPS workers use individually issued, repository-scoped tokens and server-side capabilities. The control plane supports GitHub App installation token brokerage and signed, deduplicated GitHub webhooks with polling fallback. Production deployment still needs HTTPS termination, backups, monitoring, and worker-host isolation.
+5. **Interactive planning:** The repo-scoped `$github-spec-workflow` skill lets a Codex conversation inspect current issues, reconcile overlapping scope, create missing tickets, and maintain linked specs. This is a human-driven entry point; the platform's automated Product Owner, Architect, and security stages remain separate.
 
 The service rejects engineering dispatch until the current design revision has a passed verification result, no open blocking findings, and a human security-design approval. A changed design resets that gate. Automatic merging defaults to disabled and is only available with repository opt-in.
 
