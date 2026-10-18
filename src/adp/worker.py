@@ -23,7 +23,7 @@ from adp.runtimes import _run, candidate_runtimes, runtime_identity
 from adp.process_env import child_environment, untrusted_argv
 from adp.publication import attempt_branch
 from adp.control_url import control_origin
-from adp.threat_models import in_place_controls, reject_unverified_controls, verify
+from adp.threat_models import committed_model_revision, in_place_controls, model_revision, reject_unverified_controls, verify
 
 HEARTBEAT_SECONDS = 10
 
@@ -459,23 +459,29 @@ async def _execute_job_inner(job: dict, config: dict, guard: Callable[[], Awaita
         root = (cwd / root_rel).resolve()
         if not root.is_relative_to(cwd):
             raise ValueError("Threat model path escapes worktree")
-        reject_unverified_controls(before_controls, in_place_controls(root.parent))
+        after_controls = in_place_controls(root.parent)
+        reject_unverified_controls(before_controls, after_controls)
         verification = await verify(root, Path(tool_path).expanduser(), untrusted_user=untrusted_user)
         result["verification"] = verification
         result["verification_passed"] = verification["passed"]
         result["threat_revision"] = verification.get("revision")
         if not verification["passed"]:
             raise ValueError("Threat model verification failed")
+        if in_place_controls(root.parent) != after_controls or model_revision(root) != verification["revision"]:
+            raise ValueError("Threat model changed during verification")
+        result["in_place_controls"] = sorted(key for key, in_place in after_controls.items() if in_place)
         if threat_config:
             branch = attempt_branch(job["ticket"]["number"], job["id"], job["fencing_token"])
             _git(cwd, "add", "--", ".")
             changed = bool(_git(cwd, "diff", "--cached", "--name-only"))
             if changed:
                 _git(cwd, "commit", "-m", f"Threat model for {full_name}#{job['ticket']['number']}")
+            sha = _git(cwd, "rev-parse", "HEAD")
+            if committed_model_revision(cwd, root.parent, sha) != verification["revision"]:
+                raise ValueError("Committed threat model differs from the verified revision")
             if changed or policy.get("threat_model_pr_required"):
                 if publish_intent is None:
                     raise ValueError("Durable publication intent is required")
-                sha = _git(cwd, "rev-parse", "HEAD")
                 await publish_intent("threat_modeler", threat_config["full_name"], branch, sha)
                 await _remote_cli(cwd, ["git", "push", "origin", f"{sha}:refs/heads/{branch}"], guard)
                 tm_full_name = threat_config["full_name"]
