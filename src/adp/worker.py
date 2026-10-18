@@ -21,6 +21,7 @@ import yaml
 
 from adp.runtimes import _run, candidate_runtimes, runtime_identity
 from adp.process_env import child_environment, untrusted_argv
+from adp.publication import attempt_branch
 from adp.control_url import control_origin
 from adp.threat_models import in_place_controls, reject_unverified_controls, verify
 
@@ -375,7 +376,28 @@ async def _checks(cwd: Path, commands: list[list[str]], image: str | None = None
     return results
 
 
-async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[None]] | None = None) -> dict:
+async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[None]] | None = None, publish_intent: Callable[[str, str, str, str], Awaitable[None]] | None = None) -> dict:
+    """Keep a whole issue attempt exclusive across worker processes on this host."""
+    full_name = job["repository"]["full_name"]
+    local = config.get("repositories", {}).get(full_name, {})
+    if not local.get("path"):
+        raise ValueError(f"Worker has no local checkout for {full_name}")
+    repo_path = Path(local["path"]).expanduser().resolve()
+    worktree_root = Path(local.get("worktrees", repo_path.parent / "adp-worktrees"))
+    worktree(repo_path, job["ticket"]["number"], worktree_root, group_name=config.get("untrusted_group"))
+    lock_path = worktree_root / f".adp-issue-{job['ticket']['number']}.attempt.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("Another process still owns this issue worktree") from exc
+        return await _execute_job_inner(job, config, guard, publish_intent)
+    finally:
+        os.close(fd)
+
+
+async def _execute_job_inner(job: dict, config: dict, guard: Callable[[], Awaitable[None]] | None, publish_intent: Callable[[str, str, str, str], Awaitable[None]] | None) -> dict:
     full_name = job["repository"]["full_name"]
     local = config.get("repositories", {}).get(full_name, {})
     if not local.get("path"):
@@ -445,26 +467,31 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
         if not verification["passed"]:
             raise ValueError("Threat model verification failed")
         if threat_config:
-            branch = f"adp/{re.sub(r'[^a-zA-Z0-9-]', '-', full_name).strip('-')}-issue-{job['ticket']['number']}"
+            branch = attempt_branch(job["ticket"]["number"], job["id"], job["fencing_token"])
             _git(cwd, "add", "--", ".")
             changed = bool(_git(cwd, "diff", "--cached", "--name-only"))
             if changed:
                 _git(cwd, "commit", "-m", f"Threat model for {full_name}#{job['ticket']['number']}")
-                await _remote_cli(cwd, ["git", "push", "-u", "origin", branch], guard)
             if changed or policy.get("threat_model_pr_required"):
+                if publish_intent is None:
+                    raise ValueError("Durable publication intent is required")
+                sha = _git(cwd, "rev-parse", "HEAD")
+                await publish_intent("threat_modeler", threat_config["full_name"], branch, sha)
+                await _remote_cli(cwd, ["git", "push", "origin", f"{sha}:refs/heads/{branch}"], guard)
                 tm_full_name = threat_config["full_name"]
-                existing = json.loads(await _remote_cli(cwd, ["gh", "pr", "list", "--repo", tm_full_name, "--head", branch, "--state", "open", "--json", "number"], guard))
+                existing = json.loads(await _remote_cli(cwd, ["gh", "pr", "list", "--repo", tm_full_name, "--head", branch, "--state", "all", "--limit", "1000", "--json", "number,state,headRefOid"], guard))
                 if existing:
+                    if len(existing) != 1 or existing[0]["state"] != "OPEN" or existing[0]["headRefOid"] != _git(cwd, "rev-parse", "HEAD"):
+                        raise ValueError("Existing threat-model PR does not match the current publication")
                     tm_pr = existing[0]["number"]
-                elif changed:
+                else:
                     pr_url = await _remote_cli(cwd, ["gh", "pr", "create", "--repo", tm_full_name, "--head", branch, "--title", f"Threat model: {full_name}#{job['ticket']['number']}", "--body", f"Security design for {full_name}#{job['ticket']['number']}"], guard)
                     match = re.search(r"/(\d+)$", pr_url)
                     if not match:
                         raise ValueError("GitHub did not return threat-model PR number")
                     tm_pr = int(match.group(1))
-                else:
-                    raise ValueError("Threat-model PR required but no model change or existing PR found")
                 result["threat_model_pr"] = {"repository": tm_full_name, "number": tm_pr, "head_sha": _git(cwd, "rev-parse", "HEAD")}
+                result["publication_branch"] = branch
     if stage in {"engineer", "qa", "security_engineer"}:
         checks = await _checks(cwd, policy.get("required_checks", []), local.get("check_image"))
         result["checks"] = checks
@@ -491,7 +518,7 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
             await guard()
         if not policy.get("delivery_enabled", False):
             raise ValueError("Repository delivery policy is disabled")
-        branch = f"adp/issue-{job['ticket']['number']}"
+        branch = attempt_branch(job["ticket"]["number"], job["id"], job["fencing_token"])
         _git(cwd, "add", "--", ".")
         paths = _git(cwd, "diff", "--cached", "--name-only").splitlines()
         forbidden = policy.get("forbidden_paths", ["AGENTS.md", "**/AGENTS.md"])
@@ -500,9 +527,14 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
         if _git(cwd, "status", "--porcelain"):
             _git(cwd, "commit", "-m", f"Implement issue #{job['ticket']['number']}")
         result["commit_sha"] = _git(cwd, "rev-parse", "HEAD")
-        await _remote_cli(cwd, ["git", "push", "-u", "origin", branch], guard)
-        existing = json.loads(await _remote_cli(cwd, ["gh", "pr", "list", "--repo", full_name, "--head", branch, "--state", "open", "--json", "number"], guard))
+        if publish_intent is None:
+            raise ValueError("Durable publication intent is required")
+        await publish_intent("engineer", full_name, branch, result["commit_sha"])
+        await _remote_cli(cwd, ["git", "push", "origin", f"{result['commit_sha']}:refs/heads/{branch}"], guard)
+        existing = json.loads(await _remote_cli(cwd, ["gh", "pr", "list", "--repo", full_name, "--head", branch, "--state", "all", "--limit", "1000", "--json", "number,state,headRefOid"], guard))
         if existing:
+            if len(existing) != 1 or existing[0]["state"] != "OPEN" or existing[0]["headRefOid"] != result["commit_sha"]:
+                raise ValueError("Existing implementation PR does not match the current publication")
             result["pr_number"] = existing[0]["number"]
         else:
             pr = await _remote_cli(cwd, ["gh", "pr", "create", "--repo", full_name, "--head", branch, "--title", job["ticket"]["title"], "--body", f"Closes #{job['ticket']['number']}"], guard)
@@ -510,6 +542,7 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
             if not match:
                 raise ValueError("GitHub did not return a pull request number")
             result["pr_number"] = int(match.group(1))
+        result["publication_branch"] = branch
     return result
 
 
@@ -581,6 +614,17 @@ async def _yield_claim(client: httpx.AsyncClient, job: dict, worker_id: str) -> 
         print(f"Could not release job {job['id']}: {exc}; its lease will expire for recovery", file=sys.stderr)
 
 
+async def _record_publication_intent(client: httpx.AsyncClient, job: dict, worker_id: str, kind: str, repository: str, branch: str, sha: str) -> None:
+    response = await client.post(
+        f"/jobs/{job['id']}/publication-intent",
+        json={"worker_id": worker_id, "fencing_token": job["fencing_token"], "kind": kind, "repository": repository, "branch": branch, "sha": sha},
+        timeout=15,
+    )
+    if response.status_code == 409:
+        raise ClaimLost("Publication intent rejected for stale claim")
+    response.raise_for_status()
+
+
 async def run_worker(config_path: Path, once: bool = False):
     config = yaml.safe_load(config_path.read_text())
     base = control_origin(config["control_url"])
@@ -609,7 +653,7 @@ async def run_worker(config_path: Path, once: bool = False):
                 if job:
                     work: asyncio.Task | None = None
                     try:
-                        work = asyncio.create_task(execute_job(job, config, guard=lambda: _check_claim(client, job, worker_id)))
+                        work = asyncio.create_task(execute_job(job, config, guard=lambda: _check_claim(client, job, worker_id), publish_intent=lambda kind, repo, branch, sha: _record_publication_intent(client, job, worker_id, kind, repo, branch, sha)))
                         while not work.done():
                             done, _ = await asyncio.wait({work}, timeout=HEARTBEAT_SECONDS)
                             if not done:

@@ -14,10 +14,11 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from adp.db import AuditEvent, ControlState, Job, Repository, RiskAcceptance, SessionLocal, Ticket, WebhookDelivery, WorkerCredential, now
+from adp.db import AuditEvent, ControlState, Job, PublicationAttempt, Repository, RiskAcceptance, SessionLocal, Ticket, WebhookDelivery, WorkerCredential, now
 from adp.github import GitHubClient, dependencies
 from adp.merge import GitHubMergeClient
 from adp.projects import GitHubProjectsClient
+from adp.publication import attempt_branch
 from adp.threat_review import ThreatReviewClient
 from adp.scheduler import order
 from adp.settings import settings
@@ -38,6 +39,35 @@ class WorkerPrincipal:
 def db_session():
     with SessionLocal() as db:
         yield db
+
+
+def _unsettled_publication_jobs(db: Session, ticket: Ticket) -> list[Job]:
+    jobs = db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.stage.in_(["engineer", "threat_modeler"]), Job.state.in_(["FAILED", "PUBLICATION_REVIEW", "SUCCEEDED"])).with_for_update(of=Job)).all()
+    unsettled = []
+    for job in jobs:
+        intent = (job.result or {}).get("_publication_intent")
+        if job.state == "PUBLICATION_REVIEW" or (job.state == "FAILED" and intent):
+            unsettled.append(job)
+        elif job.state == "SUCCEEDED" and intent:
+            if job.stage == "engineer" and ticket.artifacts.get("commit_sha") == intent["sha"] and ticket.state != "MERGED":
+                unsettled.append(job)
+            elif job.stage == "threat_modeler" and not ticket.artifacts.get("threat_model_pr_merged") and ticket.threat_revision == (job.result or {}).get("threat_revision"):
+                unsettled.append(job)
+    return unsettled
+
+
+async def _recognize_external_merge(db: Session, ticket: Ticket) -> bool:
+    if ticket.state == "PUBLICATION_REVIEW" or db.scalar(select(PublicationAttempt.id).where(PublicationAttempt.ticket_id == ticket.id, PublicationAttempt.state == "LATE_EFFECT").limit(1)):
+        return False
+    sha = ticket.artifacts.get("commit_sha")
+    if not ticket.pr_number or not sha:
+        return False
+    attempt = db.scalar(select(PublicationAttempt).where(PublicationAttempt.ticket_id == ticket.id, PublicationAttempt.repository == ticket.repository.full_name, PublicationAttempt.sha == sha, PublicationAttempt.state == "PUBLISHED").order_by(PublicationAttempt.created_at.desc()).limit(1))
+    if not attempt or not await GitHubClient().merged_exact(ticket.repository.full_name, ticket.pr_number, sha, attempt.branch):
+        return False
+    ticket.state = "MERGED"
+    db.add(AuditEvent(ticket_id=ticket.id, action="external_merge_recognized", detail={"pr": ticket.pr_number, "sha": sha}))
+    return True
 
 
 def _require_distinct_service_tokens():
@@ -96,6 +126,20 @@ class CompleteIn(BaseModel):
 class YieldIn(BaseModel):
     worker_id: str
     fencing_token: int
+
+
+class PublicationIntentIn(BaseModel):
+    worker_id: str
+    fencing_token: int
+    kind: str
+    repository: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    branch: str
+    sha: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+
+
+class PublicationReconcileIn(BaseModel):
+    worker_isolation_reset: bool
+    explanation: str = Field(min_length=10)
 
 
 class ApprovalIn(BaseModel):
@@ -280,8 +324,25 @@ async def poll(repo_id: str, db: Session = Depends(db_session)):
         if ticket:
             changed = (ticket.title, ticket.body, ticket.dependencies, ticket.priority, ticket.provider_override) != (issue["title"], new_body, new_dependencies, priority, override)
             if changed and ticket.state != "MERGED":
+                try:
+                    if await _recognize_external_merge(db, ticket):
+                        continue
+                except Exception as exc:
+                    raise HTTPException(502, f"PR merge verification failed: {type(exc).__name__}") from exc
                 active_jobs = db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"])).with_for_update(of=Job)).all()
+                pending_publications = _unsettled_publication_jobs(db, ticket)
                 ticket.title, ticket.body, ticket.dependencies, ticket.priority, ticket.provider_override = issue["title"], new_body, new_dependencies, priority, override
+                publication_jobs = [job for job in active_jobs if job.stage in {"engineer", "threat_modeler"} and job.state == "RUNNING"]
+                if publication_jobs or pending_publications or ticket.state == "PUBLICATION_REVIEW":
+                    for job in publication_jobs + pending_publications:
+                        _quarantine_publication(db, job, ticket, "issue changed during remote-capable job")
+                        job.result = {**(job.result or {}), "_publication_replan": True}
+                    for job in active_jobs:
+                        if job not in publication_jobs:
+                            job.state = "CANCELLED"
+                    ticket.state = "PUBLICATION_REVIEW"
+                    db.add(AuditEvent(ticket_id=ticket.id, action="publication_review_required", detail={"reason": "issue edited during publication"}))
+                    continue
                 for job in active_jobs:
                     job.state = "CANCELLED"
                 ticket.state = "NEEDS_REPLAN"
@@ -302,7 +363,24 @@ async def poll(repo_id: str, db: Session = Depends(db_session)):
     tickets = db.scalars(select(Ticket).where(Ticket.repository_id == repo.id)).all()
     for ticket in tickets:
         if ticket.number not in visible and ticket.state not in {"MERGED", "OUT_OF_SCOPE"}:
-            for job in db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"])).with_for_update(of=Job)):
+            try:
+                if await _recognize_external_merge(db, ticket):
+                    continue
+            except Exception as exc:
+                raise HTTPException(502, f"PR merge verification failed: {type(exc).__name__}") from exc
+            active_jobs = db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"])).with_for_update(of=Job)).all()
+            pending_publications = _unsettled_publication_jobs(db, ticket)
+            publication_jobs = [job for job in active_jobs if job.stage in {"engineer", "threat_modeler"} and job.state == "RUNNING"]
+            if publication_jobs or pending_publications or ticket.state == "PUBLICATION_REVIEW":
+                for job in publication_jobs + pending_publications:
+                    _quarantine_publication(db, job, ticket, "issue disappeared during remote-capable job")
+                    job.result = {**(job.result or {}), "_publication_out_of_scope": True}
+                for job in active_jobs:
+                    if job not in publication_jobs:
+                        job.state = "CANCELLED"
+                ticket.state = "PUBLICATION_REVIEW"
+                continue
+            for job in active_jobs:
                 job.state = "CANCELLED"
             ticket.state = "OUT_OF_SCOPE"
             db.add(AuditEvent(ticket_id=ticket.id, action="issue_out_of_scope", detail={"number": ticket.number}))
@@ -365,6 +443,10 @@ def ticket_detail(ticket_id: str, db: Session = Depends(db_session)):
         "security_approved_revision": ticket.security_approved_revision,
         "findings": ticket.findings, "artifacts": ticket.artifacts,
         "jobs": [{"id": j.id, "stage": j.stage, "revision": j.revision, "state": j.state, "claimed_by": j.claimed_by, "provider": j.provider, "result": j.result} for j in jobs],
+        "publication_attempts": [
+            {"id": attempt.id, "job_id": attempt.job_id, "repository": attempt.repository, "branch": attempt.branch, "sha": attempt.sha, "state": attempt.state, "last_checked_at": attempt.last_checked_at}
+            for attempt in db.scalars(select(PublicationAttempt).where(PublicationAttempt.ticket_id == ticket.id).order_by(PublicationAttempt.created_at))
+        ],
         "risk_acceptances": [
             {"threat_id": x.threat_id, "design_revision": x.design_revision, "threat_revision": x.threat_revision, "actor": x.actor, "justification": x.justification, "residual_risk": x.residual_risk, "scope": x.scope, "expires_at": x.expires_at}
             for x in db.scalars(select(RiskAcceptance).where(RiskAcceptance.ticket_id == ticket.id))
@@ -394,9 +476,14 @@ def claim(data: ClaimIn, credential: WorkerPrincipal = Depends(worker_authorized
         for job in candidates:
             ticket = db.get(Ticket, job.ticket_id)
             repo = ticket.repository
-            if allowed_repositories is not None and repo.full_name not in allowed_repositories:
+            if repo.full_name not in allowed_repositories:
+                continue
+            if job.state == "RUNNING" and job.stage in {"engineer", "threat_modeler"}:
+                _quarantine_publication(db, job, ticket, "claim expired before remote effects were reconciled")
                 continue
             if repo.paused or not repo.enabled or not dependencies_ready(db, ticket):
+                continue
+            if ticket.state == "PUBLICATION_REVIEW":
                 continue
             if job.stage == "engineer" and not security_gate(db, ticket):
                 continue
@@ -408,6 +495,7 @@ def claim(data: ClaimIn, credential: WorkerPrincipal = Depends(worker_authorized
             job.fencing_token += 1
             job.lease_expires_at = now() + timedelta(minutes=20)
             job.started_at = now()
+            job.result = {**(job.result or {}), "_claim_ticket_state": ticket.state}
             db.add(AuditEvent(ticket_id=ticket.id, action="job_claimed", detail={"job": job.id, "worker": data.worker_id, "fence": job.fencing_token}))
             return {"id": job.id, "stage": job.stage, "revision": job.revision, "fencing_token": job.fencing_token, "ticket": {"id": ticket.id, "number": ticket.number, "title": ticket.title, "body": ticket.body, "state": ticket.state, "provider_override": ticket.provider_override, "artifacts": ticket.artifacts, "findings": ticket.findings, "design_revision": ticket.design_revision, "threat_revision": ticket.threat_revision}, "repository": {"full_name": repo.full_name, "policy": repo.policy}}
     return None
@@ -422,6 +510,203 @@ def _locked_claim(db: Session, job_id: str, worker_id: str, fencing_token: int) 
             or expiry.replace(tzinfo=expiry.tzinfo or timezone.utc) <= now()):
         raise HTTPException(409, "Stale job claim")
     return job
+
+
+def _quarantine_publication(db: Session, job: Job, ticket: Ticket, reason: str) -> None:
+    job.state = "PUBLICATION_REVIEW"
+    job.lease_expires_at = None
+    ticket.state = "PUBLICATION_REVIEW"
+    db.add(AuditEvent(ticket_id=ticket.id, action="publication_review_required", detail={"job": job.id, "reason": reason, "intent": (job.result or {}).get("_publication_intent")}))
+
+
+@app.post("/reconcile-publications", dependencies=[Depends(authorized)])
+async def inspect_reconciled_publications(db: Session = Depends(db_session)):
+    """Keep retired attempt refs under observation for delayed GitHub effects."""
+    attempts = db.scalars(select(PublicationAttempt).where(PublicationAttempt.state == "RECONCILED").order_by(PublicationAttempt.created_at)).all()
+    results = {}
+    for attempt in attempts:
+        try:
+            await GitHubClient().publication_clear(attempt.repository, attempt.branch)
+        except RuntimeError as exc:
+            ticket = db.scalar(select(Ticket).where(Ticket.id == attempt.ticket_id).with_for_update())
+            attempt.review_context = {"ticket_state": ticket.state}
+            active_jobs = db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"])).with_for_update(of=Job)).all()
+            for job in active_jobs:
+                job.state = "PUBLICATION_REVIEW" if job.state == "RUNNING" and job.stage in {"engineer", "threat_modeler"} and (job.result or {}).get("_publication_intent") else "CANCELLED"
+                job.lease_expires_at = None
+            ticket.state = "PUBLICATION_REVIEW"
+            ticket.repository.paused = True
+            attempt.state = "LATE_EFFECT"
+            attempt.last_checked_at = now()
+            db.add(AuditEvent(ticket_id=ticket.id, action="late_publication_detected", detail={"branch": attempt.branch, "repository": attempt.repository, "reason": str(exc)}))
+            results[attempt.branch] = "LATE_EFFECT"
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(502, f"Publication observation failed: {type(exc).__name__}") from exc
+        else:
+            attempt.last_checked_at = now()
+            results[attempt.branch] = "CLEAR"
+            db.commit()
+    return results
+
+
+@app.post("/publication-attempts/{attempt_id}/resolve-late", dependencies=[Depends(authorized)])
+async def resolve_late_publication(attempt_id: str, data: PublicationReconcileIn, db: Session = Depends(db_session)):
+    if not data.worker_isolation_reset:
+        raise HTTPException(422, "Confirm the old worker isolation environment was reset")
+    global_state = db.get(ControlState, 1)
+    if not global_state or not global_state.paused:
+        raise HTTPException(409, "Pause all workers before resolving a late effect")
+    attempt = db.scalar(select(PublicationAttempt).where(PublicationAttempt.id == attempt_id).with_for_update())
+    if not attempt or attempt.state != "LATE_EFFECT":
+        raise HTTPException(409, "Attempt is not awaiting late-effect review")
+    ticket = db.scalar(select(Ticket).where(Ticket.id == attempt.ticket_id).with_for_update())
+    if ticket.state != "PUBLICATION_REVIEW" or not ticket.repository.paused:
+        raise HTTPException(409, "Ticket and repository must remain in publication review")
+    affected = db.scalars(select(PublicationAttempt).where(PublicationAttempt.ticket_id == ticket.id, PublicationAttempt.state.in_(["LATE_EFFECT", "ACTIVE", "PUBLISHED"])).with_for_update()).all()
+    previously_merged = any((item.review_context or {}).get("ticket_state") == "MERGED" for item in affected)
+    current_merged = None
+    if ticket.pr_number and ticket.artifacts.get("commit_sha"):
+        current = next((item for item in affected if item.state == "PUBLISHED" and item.repository == ticket.repository.full_name and item.sha == ticket.artifacts["commit_sha"]), None)
+        if current:
+            try:
+                if await GitHubClient().merged_exact(current.repository, ticket.pr_number, current.sha, current.branch):
+                    current_merged = current
+                    previously_merged = True
+            except Exception as exc:
+                raise HTTPException(409, f"Current merge cannot be verified: {type(exc).__name__}") from exc
+    evidence = {}
+    for item in affected:
+        if item is current_merged:
+            item.state = "MERGED"
+            continue
+        try:
+            evidence[item.branch] = await GitHubClient().publication_clear(item.repository, item.branch)
+        except Exception as exc:
+            raise HTTPException(409, f"Publication is not clear: {type(exc).__name__}: {exc}") from exc
+        item.state = "RECONCILED"
+        item.reconciled_at = now()
+        item.last_checked_at = now()
+    for job in db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING", "PUBLICATION_REVIEW"])).with_for_update(of=Job)):
+        job.state = "CANCELLED"
+        job.lease_expires_at = None
+    if previously_merged:
+        next_state = "MERGED"
+    else:
+        ticket.security_approved_revision = None
+        ticket.verification_passed = False
+        ticket.threat_revision = None
+        ticket.findings = []
+        ticket.pr_number = None
+        ticket.artifacts = {k: ticket.artifacts[k] for k in ("project_item_id",) if k in ticket.artifacts}
+        enqueue(db, ticket, "product_owner")
+        next_state = "NEEDS_REPLAN"
+    ticket.state = next_state
+    db.add(AuditEvent(ticket_id=ticket.id, action="late_publication_resolved", detail={"attempt": attempt.id, "remote_evidence": evidence, "worker_isolation_reset": True, "explanation": data.explanation, "next_state": next_state}))
+    db.commit()
+    return {"ticket_state": next_state, "repository_paused": ticket.repository.paused}
+
+
+@app.post("/jobs/{job_id}/reconcile-publication", dependencies=[Depends(authorized)])
+async def reconcile_publication(job_id: str, data: PublicationReconcileIn, db: Session = Depends(db_session)):
+    if not data.worker_isolation_reset:
+        raise HTTPException(422, "Confirm the old worker isolation environment was reset")
+    global_state = db.scalar(select(ControlState).where(ControlState.id == 1).with_for_update())
+    if not global_state or not global_state.paused:
+        raise HTTPException(409, "Pause all workers before reconciling publication")
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update().execution_options(populate_existing=True))
+    if not job or job.stage not in {"engineer", "threat_modeler"} or job.state not in {"PUBLICATION_REVIEW", "FAILED", "RUNNING"}:
+        raise HTTPException(409, "Job has no publication to reconcile")
+    if job.state == "RUNNING" and job.lease_expires_at and job.lease_expires_at.replace(tzinfo=job.lease_expires_at.tzinfo or timezone.utc) > now():
+        raise HTTPException(409, "Job lease is still active")
+    ticket = db.scalar(select(Ticket).where(Ticket.id == job.ticket_id).with_for_update())
+    if job.state == "FAILED" and not (job.result or {}).get("_publication_intent"):
+        raise HTTPException(409, "Failed job has no publication intent")
+    intent = (job.result or {}).get("_publication_intent")
+    sibling_incident = db.scalar(select(PublicationAttempt.id).where(PublicationAttempt.ticket_id == ticket.id, PublicationAttempt.state == "LATE_EFFECT", PublicationAttempt.branch != (intent or {}).get("branch", "")).limit(1))
+    if sibling_incident:
+        raise HTTPException(409, "Resolve the ticket's late publication incident first")
+    evidence = {}
+    attempt = db.scalar(select(PublicationAttempt).where(PublicationAttempt.branch == intent["branch"]).with_for_update()) if intent else None
+    if intent and (not attempt or attempt.job_id != job.id or attempt.state not in {"ACTIVE", "PUBLISHED"}):
+        raise HTTPException(409, "Publication attempt record is missing or already reconciled")
+    if intent:
+        try:
+            evidence = await GitHubClient().publication_clear(intent["repository"], intent["branch"])
+        except Exception as exc:
+            raise HTTPException(409, f"Remote publication is not clear: {type(exc).__name__}: {exc}") from exc
+    original_state = (job.result or {}).get("_claim_ticket_state")
+    if not original_state:
+        raise HTTPException(409, "Claim origin state is missing")
+    replan = bool((job.result or {}).get("_publication_replan"))
+    out_of_scope = bool((job.result or {}).get("_publication_out_of_scope"))
+    retry_code = bool((job.result or {}).get("_publication_retry"))
+    resume_state = (job.result or {}).get("_publication_resume_state")
+    job.fencing_token += 1
+    job.lease_expires_at = None
+    job.started_at = None
+    job.claimed_by = None
+    job.result = {}
+    if attempt:
+        attempt.state = "RECONCILED"
+        attempt.reconciled_at = now()
+        attempt.last_checked_at = now()
+    if out_of_scope:
+        job.state = "CANCELLED"
+        ticket.state = "OUT_OF_SCOPE"
+        ticket.pr_number = None
+    elif replan:
+        job.state = "CANCELLED"
+        ticket.state = "NEEDS_REPLAN"
+        ticket.pr_number = None
+        ticket.security_approved_revision = None
+        ticket.verification_passed = False
+        ticket.threat_revision = None
+        ticket.findings = []
+        ticket.artifacts = {k: ticket.artifacts[k] for k in ("project_item_id",) if k in ticket.artifacts}
+        enqueue(db, ticket, "product_owner")
+    elif retry_code:
+        job.state = "CANCELLED"
+        ticket.state = resume_state or "QA_FAILED"
+        ticket.pr_number = None
+        ticket.artifacts = {k: v for k, v in ticket.artifacts.items() if k != "commit_sha"}
+    else:
+        job.state = "QUEUED"
+        ticket.state = original_state
+    db.add(AuditEvent(ticket_id=ticket.id, action="publication_reconciled", detail={"job": job.id, "old_intent": intent, "remote_evidence": evidence, "worker_isolation_reset": True, "explanation": data.explanation, "next_state": ticket.state}))
+    db.commit()
+    return {"job_state": job.state, "ticket_state": ticket.state, "remote_evidence": evidence}
+
+
+@app.post("/jobs/{job_id}/publication-intent")
+def record_publication_intent(job_id: str, data: PublicationIntentIn, credential: WorkerPrincipal = Depends(worker_authorized), db: Session = Depends(db_session)):
+    if data.worker_id != credential.worker_id:
+        raise HTTPException(403, "Worker identity mismatch")
+    _lock_worker_credential(db, credential)
+    job = _locked_claim(db, job_id, data.worker_id, data.fencing_token)
+    ticket = db.get(Ticket, job.ticket_id)
+    if job.stage != data.kind or job.stage not in {"engineer", "threat_modeler"}:
+        raise HTTPException(409, "Job stage cannot publish this intent")
+    if data.branch != attempt_branch(ticket.number, job.id, job.fencing_token):
+        raise HTTPException(409, "Publication branch does not match the live claim")
+    if job.stage == "engineer" and data.repository != ticket.repository.full_name:
+        raise HTTPException(409, "Implementation repository does not match ticket")
+    if job.stage == "threat_modeler" and data.repository != ticket.repository.policy.get("threat_model_repository"):
+        raise HTTPException(409, "Threat-model repository does not match registered policy")
+    prior_publication = db.scalar(select(PublicationAttempt).where(PublicationAttempt.ticket_id == ticket.id, PublicationAttempt.repository == data.repository, PublicationAttempt.job_id != job.id, PublicationAttempt.state.in_(["ACTIVE", "PUBLISHED", "LATE_EFFECT"])).limit(1))
+    if prior_publication:
+        raise HTTPException(409, "Prior publication for this ticket and repository requires reconciliation")
+    intent = {"kind": data.kind, "repository": data.repository, "branch": data.branch, "sha": data.sha, "job_id": job.id, "job_revision": job.revision, "fencing_token": job.fencing_token, "design_revision": ticket.design_revision, "threat_revision": ticket.threat_revision}
+    prior = (job.result or {}).get("_publication_intent")
+    if prior and prior != intent:
+        raise HTTPException(409, "Publication intent is immutable for this claim")
+    if not prior:
+        db.add(PublicationAttempt(job_id=job.id, ticket_id=ticket.id, repository=data.repository, branch=data.branch, sha=data.sha, state="ACTIVE"))
+    job.result = {**(job.result or {}), "_publication_intent": intent}
+    db.add(AuditEvent(ticket_id=ticket.id, action="publication_intent_recorded", detail=intent))
+    db.commit()
+    return {"recorded": True, "branch": data.branch}
 
 
 @app.post("/jobs/{job_id}/heartbeat")
@@ -444,13 +729,16 @@ def yield_job(job_id: str, data: YieldIn, credential: WorkerPrincipal = Depends(
         raise HTTPException(403, "Worker identity mismatch")
     _lock_worker_credential(db, credential)
     job = _locked_claim(db, job_id, data.worker_id, data.fencing_token)
-    job.state = "QUEUED"
-    # Keep claimed_by as worker affinity so a different host cannot discard partial files.
-    job.lease_expires_at = None
-    job.started_at = None
-    db.add(AuditEvent(ticket_id=job.ticket_id, action="job_yielded", detail={"job": job.id, "worker": data.worker_id, "revision": job.revision}))
+    if (job.result or {}).get("_publication_intent"):
+        _quarantine_publication(db, job, db.get(Ticket, job.ticket_id), "claim yielded after remote publication began")
+    else:
+        job.state = "QUEUED"
+        # Keep claimed_by as worker affinity so a different host cannot discard partial files.
+        job.lease_expires_at = None
+        job.started_at = None
+        db.add(AuditEvent(ticket_id=job.ticket_id, action="job_yielded", detail={"job": job.id, "worker": data.worker_id, "revision": job.revision}))
     db.commit()
-    return {"queued": True, "job_id": job.id}
+    return {"queued": job.state == "QUEUED", "publication_review": job.state == "PUBLICATION_REVIEW", "job_id": job.id}
 
 
 @app.post("/jobs/{job_id}/release-affinity", dependencies=[Depends(authorized)])
@@ -473,15 +761,36 @@ def complete(job_id: str, data: CompleteIn, credential: WorkerPrincipal = Depend
     _lock_worker_credential(db, credential)
     job = _locked_claim(db, job_id, data.worker_id, data.fencing_token)
     ticket = db.get(Ticket, job.ticket_id)
+    intent = (job.result or {}).get("_publication_intent")
+    if data.succeeded and job.stage == "engineer" and (not intent or data.result.get("commit_sha") != intent["sha"] or data.result.get("publication_branch") != intent["branch"]):
+        raise HTTPException(422, "Implementation result does not match durable publication intent")
+    if data.succeeded and job.stage == "threat_modeler" and data.result.get("threat_model_pr") and (not intent or data.result["threat_model_pr"].get("head_sha") != intent["sha"] or data.result.get("publication_branch") != intent["branch"]):
+        raise HTTPException(422, "Threat-model result does not match durable publication intent")
     if data.succeeded:
         try:
             complete_stage(db, ticket, job.stage, data.result)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        if job.stage in {"qa", "security_engineer"} and ticket.state in {"QA_FAILED", "SECURITY_FAILED", "ESCALATED_QA", "ESCALATED_SECURITY"}:
+            prior_engineer = db.scalar(select(Job).where(Job.ticket_id == ticket.id, Job.stage == "engineer", Job.state == "SUCCEEDED").order_by(Job.revision.desc()).limit(1).with_for_update())
+            prior_intent = (prior_engineer.result or {}).get("_publication_intent") if prior_engineer else None
+            if prior_intent and ticket.artifacts.get("commit_sha") == prior_intent["sha"]:
+                resume_state = ticket.state
+                _quarantine_publication(db, prior_engineer, ticket, "code review requested another publication")
+                prior_engineer.result = {**prior_engineer.result, "_publication_retry": True, "_publication_resume_state": resume_state}
     else:
         ticket.state = "JOB_FAILED"
     job.state = "SUCCEEDED" if data.succeeded else "FAILED"
-    job.result = data.result
+    if intent and data.succeeded:
+        attempt = db.scalar(select(PublicationAttempt).where(PublicationAttempt.branch == intent["branch"]).with_for_update())
+        if not attempt:
+            raise HTTPException(409, "Publication attempt record is missing")
+        attempt.state = "PUBLISHED"
+    job.result = {**data.result, **({"_publication_intent": intent, "_claim_ticket_state": (job.result or {}).get("_claim_ticket_state")} if intent else {})}
+    if data.succeeded and job.stage == "threat_modeler" and intent and ticket.state in {"BLOCKED_FINDINGS", "ESCALATED_SECURITY"}:
+        resume_state = ticket.state
+        _quarantine_publication(db, job, ticket, "threat findings require a new model publication")
+        job.result = {**job.result, "_publication_retry": True, "_publication_resume_state": resume_state}
     job.provider = data.result.get("provider")
     job.finished_at = now()
     job.lease_expires_at = None
@@ -495,6 +804,8 @@ def retry_failed_job(job_id: str, db: Session = Depends(db_session)):
     job = db.get(Job, job_id)
     if not job or job.state != "FAILED":
         raise HTTPException(409, "Job is not failed")
+    if (job.result or {}).get("_publication_intent"):
+        raise HTTPException(409, "Remote publication must be reconciled before retry")
     ticket = db.get(Ticket, job.ticket_id)
     if ticket.state != "JOB_FAILED":
         raise HTTPException(409, "Ticket has moved on")
@@ -578,6 +889,10 @@ async def reconcile_threat_reviews(db: Session = Depends(db_session)):
                 ticket.security_approved_revision = None
                 ticket.state = "WAITING_THREAT_PR"
             ticket.artifacts = {**ticket.artifacts, "threat_model_pr_approved": review["approved"], "threat_model_pr_merged": review["merged"]}
+            if review["merged"]:
+                attempt = db.scalar(select(PublicationAttempt).where(PublicationAttempt.ticket_id == ticket.id, PublicationAttempt.repository == artifact["repository"], PublicationAttempt.sha == artifact["head_sha"], PublicationAttempt.state == "PUBLISHED").order_by(PublicationAttempt.created_at.desc()).limit(1))
+                if attempt:
+                    attempt.state = "MERGED"
             if ticket.state == "WAITING_THREAT_PR" and ready and not unresolved_blockers(ticket, db):
                 ticket.state = "WAITING_SECURITY_APPROVAL"
                 db.add(AuditEvent(ticket_id=ticket.id, action="threat_model_pr_reviewed", detail={**artifact, **review}))
