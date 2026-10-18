@@ -54,12 +54,8 @@ if [[ "$mode" != "--control-only" ]]; then
   fi
 fi
 if [[ "$mode" == "--local" ]]; then
-  if [[ -z "${ADP_WORKER_TOKEN:-}" ]]; then
-    ADP_WORKER_TOKEN="$(read_dotenv WORKER_TOKEN)"
-    export ADP_WORKER_TOKEN
-  fi
   if [[ -z "${ADP_WORKER_TOKEN:-}" || "$ADP_WORKER_TOKEN" == replace-with* ]]; then
-    echo "Set a real WORKER_TOKEN in .env or ADP_WORKER_TOKEN in the environment." >&2
+    echo "Export an issued scoped token as ADP_WORKER_TOKEN before starting the worker." >&2
     exit 1
   fi
 fi
@@ -110,7 +106,7 @@ if [[ "$mode" != "--worker-only" ]]; then
   if [[ "$resume" == true ]]; then
     "$adp" resume http://127.0.0.1:8000
   fi
-  status="$($adp control-status http://127.0.0.1:8000)"
+  status="$("$adp" control-status http://127.0.0.1:8000)"
   if printf '%s' "$status" | "$python" -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["paused"] else 1)'; then
     echo "Control plane is still paused. Run 'scripts/start.sh --resume' when ready."
     exit 0

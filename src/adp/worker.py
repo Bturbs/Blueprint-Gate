@@ -315,16 +315,18 @@ async def run_worker(config_path: Path, once: bool = False):
     base = config["control_url"].rstrip("/")
     if not (base.startswith("https://") or base.startswith("http://127.0.0.1:") or base.startswith("http://localhost:")):
         raise ValueError("Remote control plane requires HTTPS")
-    token = os.environ.get(config.get("worker_token_env", ""), "") if config.get("worker_token_env") else config.get("worker_token", "")
+    token_env = config.get("worker_token_env")
+    if not token_env or "worker_token" in config:
+        raise ValueError("Configure worker_token_env without an inline worker_token")
+    token = os.environ.get(token_env, "")
     if not token:
         raise ValueError("Worker token is not configured")
-    if config.get("worker_token_env") == "CONTROL_TOKEN":
+    if token_env == "CONTROL_TOKEN":
         raise ValueError("Administrator credential cannot be used as a worker token")
     if os.environ.get("CONTROL_TOKEN") and token == os.environ["CONTROL_TOKEN"]:
         raise ValueError("Worker and administrator credentials must be different")
     os.environ.pop("CONTROL_TOKEN", None)
-    if config.get("worker_token_env"):
-        os.environ.pop(config["worker_token_env"], None)
+    os.environ.pop(token_env, None)
     headers = {"Authorization": f"Bearer {token}"}
     worker_id = config.get("worker_id", "local-worker")
     async with httpx.AsyncClient(base_url=base, headers=headers, timeout=30) as client:

@@ -1,5 +1,6 @@
 """Authenticated control plane API. Workers never receive provider or GitHub secrets."""
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 import hmac
 import hashlib
 import json
@@ -22,6 +23,15 @@ from adp.settings import settings
 from adp.workflow import approve_security, complete_stage, dependencies_ready, enqueue, security_gate, unresolved_blockers
 
 app = FastAPI(title="Autonomous Development Platform", version="0.1.0")
+
+
+@dataclass(frozen=True)
+class WorkerPrincipal:
+    id: str
+    worker_id: str
+    token_hash: str
+    repositories: tuple[str, ...]
+    capabilities: tuple[str, ...]
 
 
 def db_session():
@@ -50,15 +60,18 @@ def worker_authorized(authorization: Annotated[str | None, Header()] = None, db:
     credential = db.scalar(select(WorkerCredential).where(WorkerCredential.token_hash == digest))
     if credential:
         expiry = credential.expires_at
-        if credential.disabled or (expiry and expiry.replace(tzinfo=expiry.tzinfo or timezone.utc) <= now()):
+        if credential.disabled or not expiry or expiry.replace(tzinfo=expiry.tzinfo or timezone.utc) <= now():
             raise HTTPException(401, "Worker credential disabled or expired")
-        credential.last_seen_at = now()
-        db.commit()
-        return credential
-    if not settings.hybrid_mode and settings.worker_token and hmac.compare_digest(raw, settings.worker_token):
-        db.commit()
-        return None
+        return WorkerPrincipal(credential.id, credential.worker_id, digest, tuple(credential.repositories), tuple(credential.capabilities))
     raise HTTPException(401, "Invalid worker token")
+
+
+def _lock_worker_credential(db: Session, principal: WorkerPrincipal) -> None:
+    credential = db.scalar(select(WorkerCredential).where(WorkerCredential.id == principal.id).with_for_update().execution_options(populate_existing=True))
+    expiry = credential.expires_at if credential else None
+    if not credential or credential.token_hash != principal.token_hash or credential.disabled or not expiry or expiry.replace(tzinfo=expiry.tzinfo or timezone.utc) <= now():
+        raise HTTPException(401, "Worker credential disabled, expired, or rotated")
+    credential.last_seen_at = now()
 
 
 class RepositoryIn(BaseModel):
@@ -102,7 +115,19 @@ class WorkerCredentialIn(BaseModel):
     worker_id: str = Field(min_length=1, max_length=100)
     repositories: list[str] = Field(min_length=1)
     capabilities: list[str] = Field(min_length=1)
-    expires_at: datetime | None = None
+    expires_at: datetime
+
+
+class WorkerCredentialRotateIn(BaseModel):
+    expires_at: datetime
+
+
+def _worker_expiry(expiry: datetime) -> datetime:
+    expiry = expiry.replace(tzinfo=timezone.utc) if not expiry.tzinfo else expiry
+    current = now()
+    if expiry <= current or expiry > current + timedelta(days=30):
+        raise HTTPException(422, "Worker credential expiry must be within 30 days")
+    return expiry
 
 
 @app.post("/workers/credentials", dependencies=[Depends(authorized)])
@@ -113,19 +138,38 @@ def issue_worker_credential(data: WorkerCredentialIn, db: Session = Depends(db_s
     if not set(data.repositories).issubset(known):
         raise HTTPException(422, "Worker repository is not registered")
     raw = secrets.token_urlsafe(48)
-    expiry = data.expires_at
-    if expiry and expiry.replace(tzinfo=expiry.tzinfo or timezone.utc) <= now():
-        raise HTTPException(422, "Expiry must be in the future")
+    expiry = _worker_expiry(data.expires_at)
     credential = WorkerCredential(worker_id=data.worker_id, token_hash=hashlib.sha256(raw.encode()).hexdigest(), repositories=sorted(set(data.repositories)), capabilities=sorted(set(data.capabilities)), expires_at=expiry)
     db.add(credential)
     db.add(AuditEvent(action="worker_credential_issued", detail={"worker_id": data.worker_id, "repositories": credential.repositories}))
     db.commit()
-    return {"id": credential.id, "worker_id": credential.worker_id, "token": raw}
+    return {"id": credential.id, "worker_id": credential.worker_id, "token": raw, "expires_at": expiry}
+
+
+@app.post("/workers/credentials/{credential_id}/rotate", dependencies=[Depends(authorized)])
+def rotate_worker_credential(credential_id: str, data: WorkerCredentialRotateIn, db: Session = Depends(db_session)):
+    credential = db.scalar(select(WorkerCredential).where(WorkerCredential.id == credential_id).with_for_update())
+    if not credential:
+        raise HTTPException(404, "Worker credential not found")
+    state = db.scalar(select(ControlState).where(ControlState.id == 1).with_for_update())
+    if not state or not state.paused:
+        raise HTTPException(409, "Pause all workers before rotating a credential")
+    running = db.scalar(select(func.count()).select_from(Job).where(Job.state == "RUNNING", Job.claimed_by == credential.worker_id)) or 0
+    if running:
+        raise HTTPException(409, "Worker has an active job; wait for it to yield")
+    expiry = _worker_expiry(data.expires_at)
+    raw = secrets.token_urlsafe(48)
+    credential.token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    credential.expires_at = expiry
+    credential.disabled = False
+    db.add(AuditEvent(action="worker_credential_rotated", detail={"worker_id": credential.worker_id, "credential_id": credential.id, "expires_at": expiry.isoformat()}))
+    db.commit()
+    return {"id": credential.id, "worker_id": credential.worker_id, "token": raw, "expires_at": expiry}
 
 
 @app.post("/workers/credentials/{credential_id}/revoke", dependencies=[Depends(authorized)])
 def revoke_worker_credential(credential_id: str, db: Session = Depends(db_session)):
-    credential = db.get(WorkerCredential, credential_id)
+    credential = db.scalar(select(WorkerCredential).where(WorkerCredential.id == credential_id).with_for_update())
     if not credential:
         raise HTTPException(404, "Worker credential not found")
     credential.disabled = True
@@ -150,7 +194,7 @@ def control_state(db: Session = Depends(db_session)):
 def set_control_state(action: str, db: Session = Depends(db_session)):
     if action not in {"pause", "resume"}:
         raise HTTPException(404, "Unknown action")
-    state = db.get(ControlState, 1)
+    state = db.scalar(select(ControlState).where(ControlState.id == 1).with_for_update())
     if state is None:
         state = ControlState(id=1, paused=False)
         db.add(state)
@@ -327,14 +371,15 @@ def ticket_detail(ticket_id: str, db: Session = Depends(db_session)):
 
 
 @app.post("/jobs/claim")
-def claim(data: ClaimIn, credential: WorkerCredential | None = Depends(worker_authorized), db: Session = Depends(db_session)):
-    if credential and data.worker_id != credential.worker_id:
+def claim(data: ClaimIn, credential: WorkerPrincipal = Depends(worker_authorized), db: Session = Depends(db_session)):
+    if data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
-    allowed_repositories = set(credential.repositories) if credential else None
-    trusted_capabilities = set(credential.capabilities) if credential else set(data.capabilities)
+    allowed_repositories = set(credential.repositories)
+    trusted_capabilities = set(credential.capabilities)
     db.commit()
     with db.begin():
-        global_state = db.get(ControlState, 1)
+        _lock_worker_credential(db, credential)
+        global_state = db.scalar(select(ControlState).where(ControlState.id == 1).with_for_update())
         if global_state and global_state.paused:
             return None
         candidates = db.scalars(
@@ -367,9 +412,10 @@ def claim(data: ClaimIn, credential: WorkerCredential | None = Depends(worker_au
 
 
 @app.post("/jobs/{job_id}/heartbeat")
-def heartbeat(job_id: str, data: ClaimIn, fencing_token: int, credential: WorkerCredential | None = Depends(worker_authorized), db: Session = Depends(db_session)):
-    if credential and data.worker_id != credential.worker_id:
+def heartbeat(job_id: str, data: ClaimIn, fencing_token: int, credential: WorkerPrincipal = Depends(worker_authorized), db: Session = Depends(db_session)):
+    if data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
+    _lock_worker_credential(db, credential)
     job = db.get(Job, job_id)
     if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != fencing_token:
         raise HTTPException(409, "Stale job claim")
@@ -382,9 +428,10 @@ def heartbeat(job_id: str, data: ClaimIn, fencing_token: int, credential: Worker
 
 
 @app.post("/jobs/{job_id}/yield")
-def yield_job(job_id: str, data: YieldIn, credential: WorkerCredential | None = Depends(worker_authorized), db: Session = Depends(db_session)):
-    if credential and data.worker_id != credential.worker_id:
+def yield_job(job_id: str, data: YieldIn, credential: WorkerPrincipal = Depends(worker_authorized), db: Session = Depends(db_session)):
+    if data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
+    _lock_worker_credential(db, credential)
     job = db.get(Job, job_id)
     if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != data.fencing_token:
         raise HTTPException(409, "Stale job claim")
@@ -411,9 +458,10 @@ def release_job_affinity(job_id: str, db: Session = Depends(db_session)):
 
 
 @app.post("/jobs/{job_id}/complete")
-def complete(job_id: str, data: CompleteIn, credential: WorkerCredential | None = Depends(worker_authorized), db: Session = Depends(db_session)):
-    if credential and data.worker_id != credential.worker_id:
+def complete(job_id: str, data: CompleteIn, credential: WorkerPrincipal = Depends(worker_authorized), db: Session = Depends(db_session)):
+    if data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
+    _lock_worker_credential(db, credential)
     job = db.get(Job, job_id)
     if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != data.fencing_token:
         raise HTTPException(409, "Stale job claim")

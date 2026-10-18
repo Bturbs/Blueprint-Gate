@@ -16,7 +16,7 @@ Requires Docker, Python 3.12+, Git, GitHub CLI, and at least one authenticated c
 
 ```bash
 cp .env.example .env
-# Set distinct random CONTROL_TOKEN and WORKER_TOKEN values, plus GITHUB_TOKEN.
+# Set a random CONTROL_TOKEN and a GitHub credential for the control plane.
 docker compose up --build -d
 uv sync --extra test --no-editable
 .venv/bin/adp doctor
@@ -31,9 +31,9 @@ curl -X POST http://127.0.0.1:8000/repositories \
 .venv/bin/adp poll http://127.0.0.1:8000 "$CONTROL_TOKEN" REPOSITORY_ID
 ```
 
-Copy `worker.example.yaml` to `worker.yaml`, set absolute local paths, export `ADP_WORKER_TOKEN`, then run `.venv/bin/adp worker --config worker.yaml`. This worker uses only outbound HTTP. For a remote control plane, use HTTPS and an issued worker credential. The worker creates `adp/issue-N` worktrees in the configured directory. `delivery_enabled` must be explicitly enabled before it will commit, push, and open an implementation PR.
+Issue a scoped worker credential through `POST /workers/credentials` with a future `expires_at` (up to 30 days), then copy `worker.example.yaml` to `worker.yaml`, set absolute local paths, export the returned token as `ADP_WORKER_TOKEN`, and run `.venv/bin/adp worker --config worker.yaml`. The raw token is returned once. This worker uses only outbound HTTP. For a remote control plane, use HTTPS. The worker creates `adp/issue-N` worktrees in the configured directory. `delivery_enabled` must be explicitly enabled before it will commit, push, and open an implementation PR.
 
-After setup, restart the local stack and worker with `./scripts/start.sh`. It reads the local worker token from `.env`, starts Docker Desktop on macOS if needed, waits for the control service, and runs the worker in the foreground. A saved pause remains in force; use `./scripts/start.sh --resume` only when you intend to resume work. Use `./scripts/start.sh --control-only` to start the services without a worker, or `./scripts/start.sh --worker-only` on a hybrid worker host with its scoped token already exported. See [reboot steps](docs/OPERATIONS.md).
+After setup, export the issued `ADP_WORKER_TOKEN` and restart the local stack and worker with `./scripts/start.sh`. It starts Docker Desktop on macOS if needed, waits for the control service, and runs the worker in the foreground. A saved pause remains in force; use `./scripts/start.sh --resume` only when you intend to resume work. Use `./scripts/start.sh --control-only` to start the services without a worker, or `./scripts/start.sh --worker-only` on a hybrid worker host with its scoped token already exported. See [reboot steps](docs/OPERATIONS.md).
 
 ### Stop and resume safely
 
