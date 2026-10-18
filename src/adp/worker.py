@@ -15,7 +15,7 @@ from typing import Awaitable, Callable
 import httpx
 import yaml
 
-from adp.runtimes import candidate_runtimes
+from adp.runtimes import _run, candidate_runtimes
 from adp.threat_models import in_place_controls, reject_unverified_controls, verify
 
 HEARTBEAT_SECONDS = 10
@@ -26,9 +26,18 @@ def _git(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _gh(cwd: Path, *args: str) -> str:
-    result = subprocess.run(["gh", *args], cwd=cwd, text=True, capture_output=True, check=True, timeout=120)
-    return result.stdout.strip()
+async def _remote_cli(cwd: Path, argv: list[str], guard: Callable[[], Awaitable[None]] | None) -> str:
+    """Keep the event loop responsive while a remote Git/GitHub call is active."""
+    if guard:
+        await guard()
+    code, output, error = await _run(argv, "", cwd, 120)
+    # A command may have succeeded just as the claim was lost. Never proceed
+    # to another effect or report success without checking the current fence.
+    if guard:
+        await guard()
+    if code:
+        raise subprocess.CalledProcessError(code, argv, output=output, stderr=error)
+    return output.strip()
 
 
 def worktree(repo_path: Path, number: int, worktree_root: Path, namespace: str = "") -> Path:
@@ -192,18 +201,14 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
             changed = bool(_git(cwd, "diff", "--cached", "--name-only"))
             if changed:
                 _git(cwd, "commit", "-m", f"Threat model for {full_name}#{job['ticket']['number']}")
-                if guard:
-                    await guard()
-                _git(cwd, "push", "-u", "origin", branch)
+                await _remote_cli(cwd, ["git", "push", "-u", "origin", branch], guard)
             if changed or policy.get("threat_model_pr_required"):
                 tm_full_name = threat_config["full_name"]
-                existing = json.loads(_gh(cwd, "pr", "list", "--repo", tm_full_name, "--head", branch, "--state", "open", "--json", "number"))
+                existing = json.loads(await _remote_cli(cwd, ["gh", "pr", "list", "--repo", tm_full_name, "--head", branch, "--state", "open", "--json", "number"], guard))
                 if existing:
                     tm_pr = existing[0]["number"]
                 elif changed:
-                    if guard:
-                        await guard()
-                    pr_url = _gh(cwd, "pr", "create", "--repo", tm_full_name, "--head", branch, "--title", f"Threat model: {full_name}#{job['ticket']['number']}", "--body", f"Security design for {full_name}#{job['ticket']['number']}")
+                    pr_url = await _remote_cli(cwd, ["gh", "pr", "create", "--repo", tm_full_name, "--head", branch, "--title", f"Threat model: {full_name}#{job['ticket']['number']}", "--body", f"Security design for {full_name}#{job['ticket']['number']}"], guard)
                     match = re.search(r"/(\d+)$", pr_url)
                     if not match:
                         raise ValueError("GitHub did not return threat-model PR number")
@@ -246,16 +251,12 @@ async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[Non
         if _git(cwd, "status", "--porcelain"):
             _git(cwd, "commit", "-m", f"Implement issue #{job['ticket']['number']}")
         result["commit_sha"] = _git(cwd, "rev-parse", "HEAD")
-        if guard:
-            await guard()
-        _git(cwd, "push", "-u", "origin", branch)
-        existing = json.loads(_gh(cwd, "pr", "list", "--repo", full_name, "--head", branch, "--state", "open", "--json", "number"))
+        await _remote_cli(cwd, ["git", "push", "-u", "origin", branch], guard)
+        existing = json.loads(await _remote_cli(cwd, ["gh", "pr", "list", "--repo", full_name, "--head", branch, "--state", "open", "--json", "number"], guard))
         if existing:
             result["pr_number"] = existing[0]["number"]
         else:
-            if guard:
-                await guard()
-            pr = _gh(cwd, "pr", "create", "--repo", full_name, "--head", branch, "--title", job["ticket"]["title"], "--body", f"Closes #{job['ticket']['number']}")
+            pr = await _remote_cli(cwd, ["gh", "pr", "create", "--repo", full_name, "--head", branch, "--title", job["ticket"]["title"], "--body", f"Closes #{job['ticket']['number']}"], guard)
             match = re.search(r"/(\d+)$", pr)
             if not match:
                 raise ValueError("GitHub did not return a pull request number")

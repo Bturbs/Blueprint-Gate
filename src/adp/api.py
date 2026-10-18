@@ -228,8 +228,9 @@ async def poll(repo_id: str, db: Session = Depends(db_session)):
         if ticket:
             changed = (ticket.title, ticket.body, ticket.dependencies, ticket.priority, ticket.provider_override) != (issue["title"], new_body, new_dependencies, priority, override)
             if changed and ticket.state != "MERGED":
+                active_jobs = db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"])).with_for_update(of=Job)).all()
                 ticket.title, ticket.body, ticket.dependencies, ticket.priority, ticket.provider_override = issue["title"], new_body, new_dependencies, priority, override
-                for job in db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"]))):
+                for job in active_jobs:
                     job.state = "CANCELLED"
                 ticket.state = "NEEDS_REPLAN"
                 ticket.security_approved_revision = None
@@ -249,7 +250,7 @@ async def poll(repo_id: str, db: Session = Depends(db_session)):
     tickets = db.scalars(select(Ticket).where(Ticket.repository_id == repo.id)).all()
     for ticket in tickets:
         if ticket.number not in visible and ticket.state not in {"MERGED", "OUT_OF_SCOPE"}:
-            for job in db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"]))):
+            for job in db.scalars(select(Job).where(Job.ticket_id == ticket.id, Job.state.in_(["QUEUED", "RUNNING"])).with_for_update(of=Job)):
                 job.state = "CANCELLED"
             ticket.state = "OUT_OF_SCOPE"
             db.add(AuditEvent(ticket_id=ticket.id, action="issue_out_of_scope", detail={"number": ticket.number}))
@@ -359,13 +360,22 @@ def claim(data: ClaimIn, credential: WorkerCredential | None = Depends(worker_au
     return None
 
 
+def _locked_claim(db: Session, job_id: str, worker_id: str, fencing_token: int) -> Job:
+    """Serialize claim mutations with reclaim and reject an expired lease."""
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update().execution_options(populate_existing=True))
+    expiry = job.lease_expires_at if job else None
+    if (not job or job.state != "RUNNING" or job.claimed_by != worker_id
+            or job.fencing_token != fencing_token or not expiry
+            or expiry.replace(tzinfo=expiry.tzinfo or timezone.utc) <= now()):
+        raise HTTPException(409, "Stale job claim")
+    return job
+
+
 @app.post("/jobs/{job_id}/heartbeat")
 def heartbeat(job_id: str, data: ClaimIn, fencing_token: int, credential: WorkerCredential | None = Depends(worker_authorized), db: Session = Depends(db_session)):
     if credential and data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
-    job = db.get(Job, job_id)
-    if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != fencing_token:
-        raise HTTPException(409, "Stale job claim")
+    job = _locked_claim(db, job_id, data.worker_id, fencing_token)
     job.lease_expires_at = now() + timedelta(minutes=20)
     ticket = db.get(Ticket, job.ticket_id)
     global_state = db.get(ControlState, 1)
@@ -378,9 +388,7 @@ def heartbeat(job_id: str, data: ClaimIn, fencing_token: int, credential: Worker
 def yield_job(job_id: str, data: YieldIn, credential: WorkerCredential | None = Depends(worker_authorized), db: Session = Depends(db_session)):
     if credential and data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
-    job = db.get(Job, job_id)
-    if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != data.fencing_token:
-        raise HTTPException(409, "Stale job claim")
+    job = _locked_claim(db, job_id, data.worker_id, data.fencing_token)
     job.state = "QUEUED"
     # Keep claimed_by as worker affinity so a different host cannot discard partial files.
     job.lease_expires_at = None
@@ -392,7 +400,7 @@ def yield_job(job_id: str, data: YieldIn, credential: WorkerCredential | None = 
 
 @app.post("/jobs/{job_id}/release-affinity", dependencies=[Depends(authorized)])
 def release_job_affinity(job_id: str, db: Session = Depends(db_session)):
-    job = db.get(Job, job_id)
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update().execution_options(populate_existing=True))
     if not job or job.state != "QUEUED" or not job.claimed_by:
         raise HTTPException(409, "Job is not a yielded claim")
     previous_worker = job.claimed_by
@@ -407,9 +415,7 @@ def release_job_affinity(job_id: str, db: Session = Depends(db_session)):
 def complete(job_id: str, data: CompleteIn, credential: WorkerCredential | None = Depends(worker_authorized), db: Session = Depends(db_session)):
     if credential and data.worker_id != credential.worker_id:
         raise HTTPException(403, "Worker identity mismatch")
-    job = db.get(Job, job_id)
-    if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != data.fencing_token:
-        raise HTTPException(409, "Stale job claim")
+    job = _locked_claim(db, job_id, data.worker_id, data.fencing_token)
     ticket = db.get(Ticket, job.ticket_id)
     if data.succeeded:
         try:

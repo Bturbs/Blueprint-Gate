@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import sys
 from datetime import timedelta
 
 import httpx
@@ -105,6 +106,12 @@ def test_expired_lease_recovers_same_job_with_new_fence(control, db_engine):
         job.lease_expires_at = now() - timedelta(seconds=1)
         db.commit()
 
+    # An expired holder must not refresh its own lease or commit a result while
+    # no replacement has claimed the job yet.
+    assert control.post(f"/jobs/{first['id']}/heartbeat", headers=worker_auth, params={"fencing_token": first["fencing_token"]}, json={"worker_id": "lost-worker"}).status_code == 409
+    assert control.post(f"/jobs/{first['id']}/yield", headers=worker_auth, json={"worker_id": "lost-worker", "fencing_token": first["fencing_token"]}).status_code == 409
+    assert control.post(f"/jobs/{first['id']}/complete", headers=worker_auth, json={"worker_id": "lost-worker", "fencing_token": first["fencing_token"], "result": {"requirements": "stale"}}).status_code == 409
+
     recovered = control.post("/jobs/claim", headers=worker_auth, json={"worker_id": "replacement"}).json()
     assert (recovered["id"], recovered["revision"]) == (first["id"], first["revision"])
     assert recovered["fencing_token"] == first["fencing_token"] + 1
@@ -124,6 +131,31 @@ def test_other_workers_yielded_jobs_do_not_hide_available_work(control, db_engin
         db.commit()
     claim = control.post("/jobs/claim", headers={"Authorization": "Bearer worker"}, json={"worker_id": "new-host"}).json()
     assert claim["ticket"]["number"] == 101
+
+
+@pytest.mark.asyncio
+async def test_remote_command_checks_claim_after_success_and_cancels_on_loss(tmp_path):
+    calls = 0
+
+    async def guard():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise worker.ClaimLost("claim changed during publication")
+
+    with pytest.raises(worker.ClaimLost):
+        await worker._remote_cli(tmp_path, [sys.executable, "-c", "print('published')"], guard)
+    assert calls == 2
+
+    marker = tmp_path / "started"
+    script = "from pathlib import Path; import sys,time; Path(sys.argv[1]).write_text('yes'); time.sleep(30)"
+    task = asyncio.create_task(worker._remote_cli(tmp_path, [sys.executable, "-c", script, str(marker)], None))
+    async with asyncio.timeout(5):
+        while not marker.exists():
+            await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
 
 
 @pytest.mark.asyncio
