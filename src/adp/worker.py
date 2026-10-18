@@ -586,6 +586,28 @@ async def _execute_job_inner(job: dict, config: dict, guard: Callable[[], Awaita
     return result
 
 
+async def execute_job(job: dict, config: dict, guard: Callable[[], Awaitable[None]] | None = None) -> dict:
+    """Run a claimed job through the disposable-VM supervisor.
+
+    ``guard`` is intentionally not sent to the guest.  Claims remain owned by
+    the trusted worker and cancellation tears down the whole guest instead of
+    letting an untrusted descendant continue with stale network grants.
+    """
+    supervisor = isolated_supervisor(config)
+    result: dict | None = None
+    try:
+        if guard:
+            await guard()
+        result = await supervisor.run(job)
+    finally:
+        teardown_verified = await supervisor.teardown()
+        if result and isinstance(result.get("isolation"), dict):
+            result["isolation"]["teardown_verified"] = teardown_verified
+    if result is None:
+        raise RuntimeError("isolated job ended without a result")
+    return result
+
+
 class PauseRequested(Exception):
     """The control plane asked this worker to stop after preserving its job."""
 

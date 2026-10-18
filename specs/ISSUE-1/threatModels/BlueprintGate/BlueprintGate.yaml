@@ -1,0 +1,1016 @@
+ID: BlueprintGate
+schemaVersion: 2
+title: Blueprint Gate delivery platform
+version: '1.0'
+status: Draft
+authors: |
+  Blueprint Gate project
+scope:
+  description: |
+    Blueprint Gate turns GitHub issues into staged software delivery. This model
+    covers the implemented control plane, durable job state, host workers,
+    threat-model verification and review, and delivery policy. It covers the
+    planned first rollout with both local and hybrid workers. GitHub, coding
+    CLI providers, and the threat-model tool are external dependencies; their
+    internal implementations are outside this model. No worker is currently
+    running. In-place software controls describe implemented code, not a live
+    deployment. Production network, backup, host-isolation, and GitHub
+    branch-protection configurations have not been demonstrated and are not
+    treated as deployed controls. The proposed per-job guest, egress proxy,
+    credential grants, and checkpoint recovery are design-stage assets; their
+    controls are not treated as implemented or deployed.
+  diagram: |
+    **Issue intake and worker context flow.** The first view follows
+    ISSUE_INTAKE, WORKER_CHANNEL, PROVIDER_PROMPT_FLOW, and the
+    ISSUE_PROMPT_INJECTION and ADMIN_BEARER_ABUSE threats.
+
+    ![Issue intake and worker context sequence](img/sequence_issue_to_worker.svg)
+
+    **Security gate and delivery flow.** The second view follows THREAT_MODEL,
+    SECURITY_DECISION, GITHUB_DELIVERY, and the MODEL_PR_REVIEW_DRIFT and
+    UNPROTECTED_MERGE threats. Optional policy branches are labeled.
+
+    ![Security gate and delivery sequence](img/sequence_security_gate.svg)
+
+    **Proposed isolated job flow.** The third view follows GUEST_JOB_CHANNEL,
+    JOB_EGRESS, JOB_CHECKPOINT, and the GUEST_EGRESS_BYPASS and
+    GUEST_OUTPUT_BOUNDARY threats. Its boundary controls are proposed.
+
+    ![Proposed isolated job sequence](img/sequence_isolated_job.svg)
+  securityObjectives:
+    - ID: CONFIDENTIALITY
+      title: Confidentiality of credentials and work data
+      description: |
+        Prevent unauthorized disclosure of service tokens, worker credentials,
+        repository data, issue content, and generated artifacts.
+      group: Data security
+    - ID: INTEGRITY
+      title: Integrity of decisions and delivery
+      description: |
+        Preserve the integrity of tickets, model revisions, approvals, code,
+        review evidence, and merge decisions.
+      group: System integrity
+    - ID: AVAILABILITY
+      title: Availability and recoverability
+      description: |
+        Keep work state recoverable and allow authorized operators to resume
+        delivery after process, host, or database failure.
+      group: Service availability
+    - ID: AUTHORIZED_DISPATCH
+      title: Authorized code dispatch
+      description: |
+        Run engineering work only after the current design and model revision
+        satisfy the security gate.
+      group: Delivery integrity
+    - ID: ACCOUNTABILITY
+      title: Accountable human decisions
+      description: |
+        Attribute security approvals, exceptions, and sensitive operations to
+        authenticated decision makers.
+      group: Governance
+  assets:
+    - ID: CONTROL_PLANE
+      type: system
+      title: Control plane API and scheduler
+      description: |
+        Accepts administrative requests, reconciles GitHub state, and dispatches
+        policy-constrained jobs.
+      inScope: true
+    - ID: JOB_DATABASE
+      type: data
+      title: Ticket, job, approval, and audit store
+      description: |
+        Durable PostgreSQL state for work claims, revisions, approvals, and logs.
+      inScope: true
+    - ID: HOST_WORKER
+      type: system
+      title: Host worker and coding runtime
+      description: |
+        Claims jobs and executes provider CLIs, checks, Git, and GitHub CLI
+        operations with its host account's privileges. The proposed design
+        divides this role into a trusted supervisor and disposable job guest.
+      inScope: true
+    - ID: ISOLATED_JOB_GUEST
+      type: system
+      title: Disposable issue-job execution guest
+      description: |
+        Proposed per-claim VM that executes the active checkout's coding CLI,
+        Git, GitHub operations, required checks, verifier, and descendants.
+      inScope: true
+    - ID: JOB_EGRESS_PROXY
+      type: system
+      title: Job-scoped outbound policy proxy
+      description: |
+        Proposed host-enforced proxy that mediates guest access to approved
+        provider and repository destinations under a claim fencing token.
+      inScope: true
+    - ID: GUEST_JOB_CHANNEL
+      type: dataflow
+      title: Supervisor-to-guest job and result channel
+      description: |
+        Proposed authenticated private channel carrying a bounded job envelope
+        into the guest and untrusted result data back to the supervisor.
+      inScope: true
+    - ID: JOB_EGRESS
+      type: dataflow
+      title: Guest outbound provider and repository traffic
+      description: |
+        Proposed proxy-mediated connections from one guest to the selected
+        model provider and authorized repository operations.
+      inScope: true
+    - ID: JOB_CHECKPOINT
+      type: data
+      title: Bounded issue-job recovery checkpoint
+      description: |
+        Proposed worktree state and manifest retained for same-ticket recovery
+        and restored only into a new guest with matching lineage.
+      inScope: true
+    - ID: ISOLATION_RECORD
+      type: data
+      title: Supervisor-created job isolation record
+      description: |
+        Proposed trusted record of guest, image, policy, mount, credential-grant,
+        egress, and teardown identity linked to the claimed revision.
+      inScope: true
+    - ID: REPOSITORY_WORKTREE
+      type: data
+      title: Issue worktree and generated artifacts
+      description: |
+        Local checkout that contains untrusted repository material, staged
+        specifications, model edits, and application changes.
+      inScope: true
+    - ID: THREAT_MODEL
+      type: data
+      title: Structured threat model and verification result
+      description: |
+        Root model YAML, its revision digest, and verification outcome used by
+        the security design gate.
+      inScope: true
+    - ID: SECURITY_DECISION
+      type: data
+      title: Security approval and risk acceptance records
+      description: |
+        Human decisions linked to design and model revisions, including expiring
+        exceptions.
+      inScope: true
+    - ID: DELIVERY_PR
+      type: data
+      title: Application and model pull requests
+      description: |
+        GitHub artifacts whose review, commit identity, checks, and merge state
+        affect delivery.
+      inScope: true
+    - ID: CONTROL_TOKEN
+      type: credential
+      title: Control-plane administrator credential
+      description: |
+        Bearer credential used for repository registration, approvals, risk
+        acceptance, pause controls, and merge reconciliation. The documented
+        local startup path also places it in the worker process environment.
+      inScope: true
+    - ID: WORKER_TOKEN
+      type: credential
+      title: Worker service credential
+      description: |
+        Local shared token or individually issued hybrid worker token used for
+        job claim, heartbeat, yield, and completion.
+      inScope: true
+    - ID: GITHUB_CREDENTIAL
+      type: credential
+      title: GitHub control and worker credentials
+      description: |
+        Control-plane GitHub token or App private key, and host Git and GitHub
+        CLI credentials used for repository changes and pull requests.
+      inScope: true
+    - ID: JOB_CREDENTIAL_GRANT
+      type: credential
+      title: Temporary provider and repository job grants
+      description: |
+        Proposed guest-only grants for the selected provider and active
+        repository, revoked when the claim ends or loses its fence.
+      inScope: true
+    - ID: ISSUE_INTAKE
+      type: dataflow
+      title: GitHub issue and project intake
+      description: |
+        Polling and optional webhook path that brings issue content and metadata
+        into the control plane.
+      inScope: true
+    - ID: WORKER_CHANNEL
+      type: dataflow
+      title: Control-plane to worker API channel
+      description: |
+        Outbound worker requests for claims, heartbeats, and results. The local
+        mode permits loopback HTTP and a shared worker token; hybrid workers
+        require an HTTPS control URL and individually issued scoped tokens.
+      inScope: true
+    - ID: PROVIDER_PROMPT_FLOW
+      type: dataflow
+      title: Worker prompt and context sent to a coding provider
+      description: |
+        Issue content, approved artifacts, findings, and selected worktree
+        context can be sent by the host CLI to an approved model provider.
+      inScope: true
+    - ID: GITHUB_DELIVERY
+      type: dataflow
+      title: GitHub branch, review, check, and merge flow
+      description: |
+        Worker and control-plane interactions with GitHub for branches, pull
+        requests, reviews, CI checks, and optional merge requests.
+      inScope: true
+    - ID: GITHUB_SERVICE
+      type: system
+      title: GitHub hosted service
+      description: |
+        External issue, repository, Projects, pull-request, and merge service.
+      inScope: false
+    - ID: MODEL_TOOL
+      type: system
+      title: Threat-model verifier implementation
+      description: |
+        External tool used to validate root threat-model YAML.
+      inScope: false
+    - ID: MODEL_PROVIDER
+      type: system
+      title: External coding model provider
+      description: |
+        Service reached by an approved host coding CLI. Its internal handling
+        of prompts and responses is outside this model.
+      inScope: false
+  attackers:
+    - ID: ISSUE_AUTHOR
+      title: Malicious or compromised issue author
+      description: |
+        Can submit or edit issue text and, where repository permissions allow,
+        labels or project membership. Cannot directly set platform policy.
+      inScope: true
+    - ID: NETWORK_ATTACKER
+      title: Network attacker
+      description: |
+        Can reach an exposed service or interfere with network traffic but does
+        not initially hold a valid control or worker token.
+      inScope: true
+    - ID: WORKER_HOST_ATTACKER
+      title: Compromised worker account or process
+      description: |
+        Can read files and credentials available to one worker host and attempt
+        to use its service identity or repository permissions.
+      inScope: true
+    - ID: PRIVILEGED_OPERATOR
+      title: Malicious or compromised operator
+      description: |
+        Can access the administrative bearer credential or host configuration
+        and may try to conceal or misattribute sensitive decisions.
+      inScope: true
+analysis: |
+  The central trust boundary is between untrusted GitHub issue and repository
+  content and a host worker that can run coding CLIs, checks, Git, and GitHub CLI
+  commands. The control plane separates provider credentials from its own
+  process, but the worker retains host-level execution and repository access.
+  The engineering gate checks the current threat-model revision, findings, and
+  a human approval; YAML verification alone establishes structure, not the
+  effectiveness of a design. Separate model PR review and automatic merge are
+  policy options. Provider CLIs are another trust boundary because work
+  context can leave the worker host. Deployment controls and GitHub protection
+  settings require operational validation before their risk can be marked
+  mitigated. The proposed isolation design adds a supervisor-to-guest boundary
+  for untrusted job data and results, a host-enforced guest egress boundary,
+  temporary credentials, and checkpoint transfer into a fresh guest. The
+  supervisor must not trust guest output or import checkpoint content into its
+  own execution context. These controls remain proposed pending deployment
+  and hostile-fixture evidence.
+threats:
+  - ID: ISSUE_PROMPT_INJECTION
+    title: Issue content redirects a coding worker
+    attack: |
+      An issue author places instructions in the issue or repository content
+      that the coding CLI later reads. If the runtime follows those instructions
+      as authority, it can change files or execute commands outside the intended
+      ticket. The prompt labels issue and repository content as untrusted, but
+      model behavior is not a complete enforcement boundary.
+    threatType: Tampering, Elevation of Privilege
+    impactDesc: |
+      Unauthorized code or model changes, credential exposure, or malicious
+      pull-request content can result from one accepted job.
+    impactedSecObj:
+      - REFID: INTEGRITY
+      - REFID: CONFIDENTIALITY
+      - REFID: AUTHORIZED_DISPATCH
+    attackers:
+      - REFID: ISSUE_AUTHOR
+    assets:
+      - REFID: ISSUE_INTAKE
+      - REFID: HOST_WORKER
+      - REFID: REPOSITORY_WORKTREE
+      - REFID: ISOLATED_JOB_GUEST
+      - REFID: GUEST_JOB_CHANNEL
+      - REFID: JOB_EGRESS
+      - REFID: JOB_CREDENTIAL_GRANT
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/1
+    countermeasures:
+      - ID: MARK_UNTRUSTED_INPUT
+        title: Label issue and repository content as untrusted
+        description: |
+          Worker prompts explicitly instruct the coding runtime not to treat
+          issue text or repository content as higher-priority instructions.
+        inPlace: true
+        public: true
+      - ID: ISOLATE_UNTRUSTED_WORK
+        title: Confine worker execution and outbound access
+        description: |
+          Run untrusted jobs under a dedicated disposable identity or VM with
+          minimal filesystem, process, network, and credential access.
+          Local staging now uses an unmounted Lima VM with a separate agent
+          identity and supervisor-only credentials. A hostile agent fixture
+          could not read the supervisor home or modify protected Git metadata.
+          The agent's filesystem view now hides other issue worktrees; model
+          verification has no network access. Provider egress is still
+          unrestricted, active base Git history remains readable, and no real
+          ticket has completed in the VM.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Worker host operator
+      - ID: ENFORCE_DISPOSABLE_GUEST
+        title: Confine every job command to a disposable guest
+        description: |
+          Fail closed unless a pinned guest with no host mounts can run every
+          issue-driven CLI, Git operation, verifier, check, and descendant.
+          Keep supervisor credentials and unrelated checkouts outside it.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Worker host operator
+      - ID: RESTRICT_JOB_CREDENTIALS
+        title: Grant only selected provider and repository credentials
+        description: |
+          Give a guest only the selected provider's credential and a temporary
+          token for the active repository and required role. Keep administrator
+          and worker-control credentials in the trusted supervisor, and revoke
+          grants at claim end or loss.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Worker host operator
+
+  - ID: GUEST_EGRESS_BYPASS
+    title: Untrusted job escapes outbound destination policy
+    attack: |
+      Issue-controlled code or a coding CLI attempts direct network access or
+      uses DNS changes, redirects, alternate ports, or a permitted proxy route
+      to reach an unapproved internet, private-network, or host destination.
+      The current staging provider route is unrestricted; the proposed proxy
+      is not yet implemented or tested across both providers.
+    threatType: Information Disclosure, Elevation of Privilege
+    impactDesc: |
+      The job can transmit repository content or job credentials to an attacker
+      endpoint or reach services outside its authorized repository workflow.
+    impactedSecObj:
+      - REFID: CONFIDENTIALITY
+      - REFID: INTEGRITY
+    attackers:
+      - REFID: ISSUE_AUTHOR
+    assets:
+      - REFID: ISOLATED_JOB_GUEST
+      - REFID: JOB_EGRESS_PROXY
+      - REFID: JOB_EGRESS
+      - REFID: JOB_CREDENTIAL_GRANT
+      - REFID: REPOSITORY_WORKTREE
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:L'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/1
+    countermeasures:
+      - ID: ENFORCE_FENCED_EGRESS
+        title: Deny direct guest routes and fence approved egress
+        description: |
+          Give guests no direct route. Enforce versioned destination, address,
+          port, DNS, and redirect rules in a host proxy bound to the job and
+          current fencing token. Deny unknown and private destinations and
+          revoke access before a lost claim can be replaced.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Worker host operator
+
+  - ID: GUEST_OUTPUT_BOUNDARY
+    title: Guest result or checkpoint crosses into supervisor authority
+    attack: |
+      Issue-controlled code returns oversized or malformed result data, a
+      forged checkout revision or isolation claim, or checkpoint content with
+      paths, links, or metadata that affect another job. If the supervisor
+      trusts or extracts that content, a guest can cross the intended VM
+      boundary or cause a later claim to resume unauthorized state.
+    threatType: Tampering, Elevation of Privilege, Information Disclosure
+    impactDesc: |
+      A false verification or delivery record can authorize incorrect work;
+      hostile checkpoint import can alter unrelated work or expose supervisor
+      and other-job data.
+    impactedSecObj:
+      - REFID: INTEGRITY
+      - REFID: CONFIDENTIALITY
+      - REFID: AUTHORIZED_DISPATCH
+    attackers:
+      - REFID: ISSUE_AUTHOR
+    assets:
+      - REFID: GUEST_JOB_CHANNEL
+      - REFID: JOB_CHECKPOINT
+      - REFID: ISOLATION_RECORD
+      - REFID: JOB_DATABASE
+      - REFID: REPOSITORY_WORKTREE
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:C/C:H/I:H/A:H'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/1
+    countermeasures:
+      - ID: VALIDATE_GUEST_PROTOCOL
+        title: Validate result data against trusted claim state
+        description: |
+          Authenticate the private channel, bind every message and result to
+          job, repository, stage, revision, and fence, and reject oversized or
+          malformed fields. Derive isolation records in the supervisor rather
+          than accepting guest assertions.
+        inPlace: false
+        public: true
+      - ID: BOUND_CHECKPOINT_RECOVERY
+        title: Restore only bounded same-lineage checkpoint data
+        description: |
+          Limit checkpoint size and retention, verify digest and lineage, and
+          treat the checkpoint as opaque on the supervisor. Restore it only
+          inside a fresh guest, reject unsafe paths and links, and never run
+          checkpoint content in the supervisor context.
+        inPlace: false
+        public: true
+
+  - ID: WORKTREE_CODE_EXECUTION
+    title: Repository checks execute hostile code on the worker host
+    attack: |
+      A job modifies the worktree or its build scripts, then a configured check
+      or coding runtime executes that material with the worker host account's
+      privileges. A compromised dependency or repository commit can use the
+      same path. Commands are selected by repository policy, but their content
+      and dependencies may be controlled by the checkout.
+    threatType: Elevation of Privilege, Information Disclosure
+    impactDesc: |
+      Host files, GitHub CLI credentials, other checkouts, or network resources
+      accessible to the worker account may be compromised.
+    impactedSecObj:
+      - REFID: CONFIDENTIALITY
+      - REFID: INTEGRITY
+      - REFID: AVAILABILITY
+    attackers:
+      - REFID: ISSUE_AUTHOR
+      - REFID: WORKER_HOST_ATTACKER
+    assets:
+      - REFID: HOST_WORKER
+      - REFID: REPOSITORY_WORKTREE
+      - REFID: GITHUB_CREDENTIAL
+    CVSS:
+      vector: 'CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/2
+    countermeasures:
+      - ID: CHECK_COMMAND_ALLOWLIST
+        title: Use configured check commands
+        description: |
+          The worker takes required check commands from repository policy
+          rather than from model output or issue text.
+        inPlace: true
+        public: true
+      - ID: DISPOSABLE_WORKER_HOST
+        title: Run each untrusted checkout in an isolated worker
+        description: |
+          Use a dedicated disposable account or VM and restrict credentials
+          and network access available during code execution.
+          Local staging runs configured checks in a rootless, read-only,
+          networkless container inside an unmounted Lima VM. A hostile check
+          fixture could not read supervisor files or reach the network; a
+          normal fixture passed. The separate provider and verifier processes
+          now have a filesystem view limited to the active ticket worktree and
+          required read-only paths. Provider and GitHub authentication and a
+          real issue job have not been exercised in that VM.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Worker host operator
+
+  - ID: WORKER_IDENTITY_THEFT
+    title: Stolen worker credential claims or completes jobs
+    attack: |
+      An attacker obtains a worker bearer token from a host or configuration
+      and calls the job API as that worker. Tokens expire and are scoped.
+      The staged VM keeps its token in the supervisor's private home and a
+      rotated token invalidated the old one without losing a queued job. A
+      compromised supervisor or misconfigured worker host can still expose
+      the current token before revocation.
+    threatType: Spoofing, Tampering
+    impactDesc: |
+      Jobs may be claimed, yielded, or completed with attacker-supplied results,
+      affecting ticket state and review evidence.
+    impactedSecObj:
+      - REFID: INTEGRITY
+      - REFID: AUTHORIZED_DISPATCH
+    attackers:
+      - REFID: WORKER_HOST_ATTACKER
+    assets:
+      - REFID: WORKER_TOKEN
+      - REFID: WORKER_CHANNEL
+      - REFID: JOB_DATABASE
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/3
+    countermeasures:
+      - ID: SCOPED_HYBRID_CREDENTIAL
+        title: Scope and revoke hybrid worker credentials
+        description: |
+          Individually issued hybrid tokens are stored as hashes, bound to a
+          worker ID, and limited to registered repositories and capabilities.
+        inPlace: true
+        public: true
+      - ID: WORKER_CREDENTIAL_LIFECYCLE
+        title: Set expiry and rotate worker credentials
+        description: |
+          Credentials require expiry and can be rotated or revoked under a
+          global pause. Local staging stored its scoped token mode 0600 in
+          the VM supervisor's private home; the agent could not read that
+          home. A live rotation rejected the old token, accepted the new one,
+          and preserved a queued job. A separate revocation rejected further
+          claims. A real ticket and recovery sequence remain unverified.
+        inPlace: true
+        public: true
+        operational: true
+        operator: Platform operator
+
+  - ID: ADMIN_BEARER_ABUSE
+    title: Administrative bearer token enables unaccountable decisions
+    attack: |
+      The startup path removes the control token from worker processes, and
+      the staged VM separates provider CLIs from the supervisor identity.
+      The active Mac staging API additionally checks a GitHub user token and
+      configured numeric role IDs for manual decisions. A leaked control
+      token alone cannot supply those decisions. A compromised Mac operator
+      account may still access both its control token and GitHub login, then
+      approve a design, accept risk, register policy, or alter pause state.
+    threatType: Spoofing, Repudiation
+    impactDesc: |
+      An attacker who obtains both credentials can authorize code dispatch or
+      record an exception while the audit trail attributes the act to the
+      compromised operator identity.
+    impactedSecObj:
+      - REFID: ACCOUNTABILITY
+      - REFID: AUTHORIZED_DISPATCH
+      - REFID: INTEGRITY
+    attackers:
+      - REFID: PRIVILEGED_OPERATOR
+      - REFID: WORKER_HOST_ATTACKER
+    assets:
+      - REFID: CONTROL_TOKEN
+      - REFID: SECURITY_DECISION
+      - REFID: CONTROL_PLANE
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/4
+    countermeasures:
+      - ID: ADMIN_BEARER_CHECK
+        title: Require the control token for administrative endpoints
+        description: |
+          Administrative API operations compare a bearer credential before
+          accepting requests and record decision events in the audit store.
+        inPlace: true
+        public: true
+      - ID: HUMAN_IDENTITY_BINDING
+        title: Bind approvals to authenticated human identity
+        description: |
+          Merged Blueprint Gate PR #27 verifies a separate user token against
+          GitHub /user for each manual decision, checks numeric reviewer or
+          operator IDs, rejects a mismatched actor, and records the verified
+          identity in approvals and audit events. Strict mode was enabled and
+          exercised in the active isolated Mac staging API; the prior API was
+          stopped with zero jobs. Both credentials still reside within the
+          Mac operator account, so host compromise remains a material gap.
+        inPlace: true
+        public: true
+      - ID: DROP_ADMIN_CREDENTIAL_FROM_WORKER
+        title: Keep administrator credentials out of worker execution
+        description: |
+          Run worker and coding CLI processes with an explicit environment
+          allowlist that excludes administrator credentials and other secrets
+          unrelated to the active job.
+        inPlace: true
+        public: true
+
+  - ID: GITHUB_CREDENTIAL_COMPROMISE
+    title: GitHub credentials exposed through a control or worker host
+    attack: |
+      A compromised control container, worker account, or check process reads
+      the GitHub token, App private key, or CLI credentials present in its own
+      environment and uses their repository permissions.
+    threatType: Information Disclosure, Spoofing
+    impactDesc: |
+      The attacker can inspect or modify repositories and pull requests within
+      the stolen credential's scope, potentially bypassing platform workflow.
+    impactedSecObj:
+      - REFID: CONFIDENTIALITY
+      - REFID: INTEGRITY
+    attackers:
+      - REFID: WORKER_HOST_ATTACKER
+      - REFID: PRIVILEGED_OPERATOR
+    assets:
+      - REFID: GITHUB_CREDENTIAL
+      - REFID: GITHUB_DELIVERY
+    CVSS:
+      vector: 'CVSS:3.1/AV:L/AC:L/PR:H/UI:N/S:C/C:H/I:H/A:H'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/5
+    countermeasures:
+      - ID: CREDENTIAL_PLANE_SEPARATION
+        title: Separate control and worker GitHub credentials
+        description: |
+          Control-plane GitHub credentials are not placed in worker API job
+          payloads; workers use their own host Git and GitHub CLI credentials.
+        inPlace: true
+        public: true
+      - ID: MINIMUM_GITHUB_PERMISSIONS
+        title: Limit and rotate GitHub credentials
+        description: |
+          Restrict App and worker credentials to required repositories and
+          permissions, store them outside check processes, and rotate them.
+          The staged VM separates supervisor credential files from the agent,
+          but repository-scoped GitHub delivery is not yet provisioned there.
+        inPlace: false
+        public: true
+        operational: true
+        operator: GitHub organization operator
+
+  - ID: PROVIDER_CONTEXT_DISCLOSURE
+    title: Sensitive work context reaches an unsuitable model provider
+    attack: |
+      An issue author induces a coding CLI to include sensitive worktree data
+      in a prompt, or an operator configures routing that permits a provider
+      for a data classification the organization did not intend to share.
+      The worker sends issue and approved-artifact context to the selected CLI;
+      the CLI can also read repository files during its stage.
+    threatType: Information Disclosure
+    impactDesc: |
+      Repository data, security findings, or other work context may be sent
+      outside the intended trust boundary and retained by an unsuitable
+      external service.
+    impactedSecObj:
+      - REFID: CONFIDENTIALITY
+    attackers:
+      - REFID: ISSUE_AUTHOR
+      - REFID: PRIVILEGED_OPERATOR
+    assets:
+      - REFID: PROVIDER_PROMPT_FLOW
+      - REFID: REPOSITORY_WORKTREE
+      - REFID: MODEL_PROVIDER
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/6
+    countermeasures:
+      - ID: PROVIDER_CLASSIFICATION_ROUTING
+        title: Allow only classified provider routes
+        description: |
+          Runtime selection checks repository policy for allowed providers
+          and permitted data classifications before invoking a CLI.
+        inPlace: true
+        public: true
+      - ID: PROVIDER_DATA_MINIMIZATION
+        title: Restrict data exposed to coding providers
+        description: |
+          Define a deployment-specific data policy, exclude secret-bearing
+          files from worker context, and limit prompt content to what each
+          stage needs. The staged agent cannot read supervisor credentials,
+          but it can read other issue worktrees and base Git object history
+          inside the same VM; provider egress is not yet restricted.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Platform operator
+
+  - ID: STALE_JOB_SIDE_EFFECTS
+    title: A stale worker leaves Git side effects after losing its claim
+    attack: |
+      A worker loses connectivity or its lease while a CLI or Git operation is
+      underway. A new claim can start from durable state even though the old
+      process already changed local files or a remote branch.
+    threatType: Tampering
+    impactDesc: |
+      Duplicate, conflicting, or unreviewed branch and pull-request effects
+      can diverge from the ticket's recorded revision.
+    impactedSecObj:
+      - REFID: INTEGRITY
+      - REFID: AUTHORIZED_DISPATCH
+    attackers:
+      - REFID: WORKER_HOST_ATTACKER
+    assets:
+      - REFID: HOST_WORKER
+      - REFID: JOB_DATABASE
+      - REFID: DELIVERY_PR
+    CVSS:
+      vector: 'CVSS:3.1/AV:L/AC:H/PR:H/UI:N/S:U/C:N/I:H/A:L'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/7
+    countermeasures:
+      - ID: FENCED_JOB_COMPLETION
+        title: Fence stale job completion
+        description: |
+          Claims increment a fencing token, and heartbeat, yield, and complete
+          requests reject stale tokens. Yielded jobs retain worker affinity.
+        inPlace: true
+        public: true
+      - ID: REMOTE_SIDE_EFFECT_RECONCILIATION
+        title: Reconcile remote side effects after claim loss
+        description: |
+          A merged control-plane change records attempt-specific publication
+          intents, quarantines uncertain jobs, and checks branches and pull
+          requests before release. Retired attempts remain under observation
+          and automatic merge rechecks them. Local tests cover lost responses
+          after successful push and pull-request creation. GitHub can still
+          accept an already submitted request between checks, and recovery
+          has not been exercised with a real staged delivery credential.
+        inPlace: false
+        public: true
+
+  - ID: FALSE_MODEL_ASSURANCE
+    title: Valid YAML conceals an unmitigated design risk
+    attack: |
+      A model author omits an important boundary or marks an ineffective
+      countermeasure as present. Schema verification can pass because it checks
+      structure rather than proving that the system is secure.
+    threatType: Tampering
+    impactDesc: |
+      Engineering may begin under a misleading model and leave a material
+      vulnerability in delivered code.
+    impactedSecObj:
+      - REFID: INTEGRITY
+      - REFID: AUTHORIZED_DISPATCH
+    attackers:
+      - REFID: ISSUE_AUTHOR
+      - REFID: PRIVILEGED_OPERATOR
+    assets:
+      - REFID: THREAT_MODEL
+      - REFID: SECURITY_DECISION
+    CVSS:
+      vector: 'CVSS:3.1/AV:L/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:H'
+    pentestTestable: false
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/8
+    countermeasures:
+      - ID: CURRENT_REVISION_GATE
+        title: Bind dispatch to verified current model and human approval
+        description: |
+          Engineering dispatch requires a passed root-model verification,
+          resolved or accepted blocking findings, and security approval tied
+          to the current design and model revision.
+        inPlace: true
+        public: true
+      - ID: REJECT_NEW_IN_PLACE_CLAIMS
+        title: Reject newly asserted design-stage controls
+        description: |
+          The worker rejects controls newly marked in place while editing the
+          model during the threat-model stage.
+        inPlace: true
+        public: true
+      - ID: INDEPENDENT_EVIDENCE_REVIEW
+        title: Review control evidence and model completeness
+        description: |
+          Require a human reviewer to compare architecture, source evidence,
+          deployment state, and every in-place control before approving.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Security reviewer
+
+  - ID: MODEL_PR_REVIEW_DRIFT
+    title: Threat-model pull request changes after review
+    attack: |
+      A model PR receives approval, then its head changes or a different model
+      revision is used. If review is not tied to the exact head, the changed
+      content could be treated as approved.
+    threatType: Tampering
+    impactDesc: |
+      Engineering or final delivery proceeds using a model that independent
+      reviewers did not approve.
+    impactedSecObj:
+      - REFID: INTEGRITY
+      - REFID: AUTHORIZED_DISPATCH
+    attackers:
+      - REFID: PRIVILEGED_OPERATOR
+    assets:
+      - REFID: THREAT_MODEL
+      - REFID: DELIVERY_PR
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:N/I:H/A:H'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/9
+    countermeasures:
+      - ID: EXACT_HEAD_MODEL_REVIEW
+        title: Check independent review on the exact model head
+        description: |
+          When separate-model review is enabled, the control plane checks the
+          expected PR head and a non-author human approval for that commit.
+        inPlace: true
+        public: true
+      - ID: ENABLE_MODEL_PR_POLICY
+        title: Require separate model PR review in repository policy
+        description: |
+          Enable the optional model PR gate and protect the model branch in
+          GitHub for the deployed repository.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Repository operator
+
+  - ID: UNPROTECTED_MERGE
+    title: Application changes merge without intended protection
+    attack: |
+      An operator enables automatic merging without matching GitHub branch
+      protection, or an authorized GitHub credential merges outside the
+      platform. The control-plane checks govern its own merge requests but
+      cannot enforce all direct GitHub actions.
+    threatType: Tampering
+    impactDesc: |
+      Code can land without required independent review, CI, or current
+      security approval.
+    impactedSecObj:
+      - REFID: INTEGRITY
+      - REFID: AUTHORIZED_DISPATCH
+    attackers:
+      - REFID: PRIVILEGED_OPERATOR
+      - REFID: WORKER_HOST_ATTACKER
+    assets:
+      - REFID: DELIVERY_PR
+      - REFID: GITHUB_DELIVERY
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:N/I:H/A:H'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/10
+    countermeasures:
+      - ID: OPT_IN_MERGE_CHECKS
+        title: Apply opt-in merge eligibility checks
+        description: |
+          The platform defaults automatic merging to disabled and checks the
+          validated commit, PR state, CI results, path policy, dependencies,
+          threat-model state, and high-risk approval before its merge request.
+        inPlace: true
+        public: true
+      - ID: GITHUB_BRANCH_PROTECTION
+        title: Enforce GitHub branch protection
+        description: |
+          Configure required reviews, checks, and permissions in GitHub to
+          constrain direct pushes and merges outside the platform.
+        inPlace: false
+        public: true
+        operational: true
+        operator: GitHub organization operator
+
+  - ID: WEBHOOK_SPOOFING_OR_REPLAY
+    title: Forged or replayed GitHub webhook triggers reconciliation
+    attack: |
+      A network attacker sends a fabricated issue or PR event to an exposed
+      webhook endpoint, or repeats a previously valid delivery identifier.
+    threatType: Spoofing, Denial of Service
+    impactDesc: |
+      Unauthorized or repeated reconciliation consumes service capacity and
+      may alter ticket state if a forged event is accepted.
+    impactedSecObj:
+      - REFID: INTEGRITY
+      - REFID: AVAILABILITY
+    attackers:
+      - REFID: NETWORK_ATTACKER
+    assets:
+      - REFID: ISSUE_INTAKE
+      - REFID: CONTROL_PLANE
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:L'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/11
+    countermeasures:
+      - ID: SIGNED_DEDUPED_WEBHOOK
+        title: Verify and deduplicate webhook deliveries
+        description: |
+          The optional webhook endpoint checks an HMAC signature, limits body
+          size, records delivery IDs, and rejects duplicates. It is disabled
+          when no webhook secret is configured.
+        inPlace: true
+        public: true
+      - ID: WEBHOOK_SECRET_OPERATIONS
+        title: Protect and rotate deployed webhook secrets
+        description: |
+          Configure a unique secret, protect it in deployment, and rotate it
+          when access changes or compromise is suspected.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Platform operator
+
+  - ID: HYBRID_CHANNEL_INTERCEPTION
+    title: Hybrid worker traffic is exposed by an unsafe deployment
+    attack: |
+      A remote deployment terminates TLS incorrectly or exposes a control
+      endpoint without trusted certificate validation. A network attacker then
+      intercepts worker credentials, job content, or completion results. The
+      current Mac-to-Lima path uses a loopback SSH tunnel and a locally trusted
+      Caddy HTTPS proxy; any later external topology needs separate review.
+    threatType: Information Disclosure, Tampering
+    impactDesc: |
+      Work data leaks and an attacker may impersonate a worker or alter job
+      results if the channel is compromised.
+    impactedSecObj:
+      - REFID: CONFIDENTIALITY
+      - REFID: INTEGRITY
+    attackers:
+      - REFID: NETWORK_ATTACKER
+    assets:
+      - REFID: WORKER_CHANNEL
+      - REFID: WORKER_TOKEN
+    CVSS:
+      vector: 'CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N'
+    pentestTestable: true
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/12
+    countermeasures:
+      - ID: REMOTE_HTTPS_REQUIREMENT
+        title: Reject non-HTTPS remote worker URLs
+        description: |
+          The worker accepts plain HTTP only for loopback control URLs and
+          requires HTTPS for remote connections.
+        inPlace: true
+        public: true
+      - ID: TRUSTED_TLS_TERMINATION
+        title: Verify deployed TLS termination
+        description: |
+          The local Mac staging API runs in hybrid mode behind a loopback-only
+          Caddy HTTPS proxy. The Lima VM rejected its untrusted private CA,
+          then trusted the specific CA and completed a synthetic claim and
+          job through the HTTPS route. The proxy returned 404 for /control.
+          No externally reachable remote worker deployment is configured.
+        inPlace: true
+        public: true
+        operational: true
+        operator: Platform operator
+
+  - ID: JOB_STATE_LOSS
+    title: Database failure loses delivery and approval state
+    attack: |
+      A database volume fails, is corrupted, or is changed during deployment
+      without a restorable backup. An attacker with host access could also
+      delete the volume. Durable row locking does not provide disaster recovery.
+    threatType: Denial of Service, Tampering
+    impactDesc: |
+      Tickets, job claims, audit events, approvals, and risk acceptance records
+      can be lost or become unavailable, blocking safe resumption.
+    impactedSecObj:
+      - REFID: AVAILABILITY
+      - REFID: INTEGRITY
+      - REFID: ACCOUNTABILITY
+    attackers:
+      - REFID: WORKER_HOST_ATTACKER
+      - REFID: PRIVILEGED_OPERATOR
+    assets:
+      - REFID: JOB_DATABASE
+      - REFID: CONTROL_PLANE
+    CVSS:
+      vector: 'CVSS:3.1/AV:L/AC:L/PR:H/UI:N/S:U/C:N/I:H/A:H'
+    pentestTestable: false
+    fullyMitigated: false
+    ticketLink: https://github.com/Bturbs/Blueprint-Gate/issues/13
+    countermeasures:
+      - ID: DURABLE_JOB_QUEUE
+        title: Persist job state and fence claims
+        description: |
+          PostgreSQL stores jobs and approvals; row locks and fencing tokens
+          coordinate claims and reject stale completion.
+        inPlace: true
+        public: true
+      - ID: TESTED_DATABASE_RESTORE
+        title: Maintain and test database backups
+        description: |
+          The active Mac staging database has daily local dumps and a weekly
+          separate-database restore check. A fresh dump matched paused live
+          core rows and both launchd jobs exited successfully. Copies remain
+          on the same Mac; encrypted separately protected storage and a
+          restore from that copy have not been demonstrated.
+        inPlace: false
+        public: true
+        operational: true
+        operator: Platform operator

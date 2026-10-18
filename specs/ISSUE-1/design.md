@@ -1,0 +1,43 @@
+# Issue #1 — Isolate work driven by untrusted issues and repositories
+
+## Current state and decision
+
+The existing `worker.py` launches Git, GitHub CLI, required checks, and model CLIs with its host user's access; `threat_models.py` also launches the verifier on that host. Codex's sandbox setting and the prompt's untrusted-input warning do not enforce a boundary around all of those processes. The worktree contains an untracked `specs/ISSUE-1/requirements.md`; preserve it. No implementation or deployment evidence was found.
+
+Use a dedicated, disposable VM per claimed job on a Linux worker host. A trusted worker supervisor claims and heartbeats jobs, launches the VM, receives its bounded result, and destroys it. The supervisor holds the worker control credential but never executes repository commands. The guest holds one active checkout and runs all issue-driven work, including Git, `gh`, Codex or Claude, checks, the threat-model verifier, and their descendants. Disable the existing host-execution path when isolation is required; an unsupported host fails closed.
+
+## Trust boundaries and dataflow
+
+1. The control plane sends the trusted supervisor a job with its stage, revision, fencing token, repository policy, and untrusted issue data. The existing `security_gate` remains authoritative before engineering is queued and claimed.
+2. Before guest startup, the supervisor validates a versioned isolation policy, pinned guest image, empty mount manifest, network rules, and available job credentials. It records their digests. A failed validation prevents guest execution.
+3. The VM receives the job over a private, authenticated supervisor-to-guest channel. The worker control token, administrator token, GitHub App private key, host home, sibling checkouts, and control-plane storage never enter the guest. The guest fetches or restores only its active repository checkout. For a separate threat-model stage, that repository is the active checkout; application requirements and design arrive as bounded data, not a second mounted checkout. The verifier and dependencies are pinned in the guest image.
+4. `AgentRuntime` continues to choose approved Codex or Claude adapters inside the guest. A provider fallback starts a fresh guest with only the replacement provider's credential and network profile. Required checks and delivery commands execute in that same boundary. The guest sends a validated result and checkpoint to the supervisor; the supervisor submits completion with the current fencing token.
+5. The supervisor revokes job network and credential grants, terminates the entire VM, and records teardown. On pause, retry, or host restart, it restores a bounded checkpoint into a new VM only when repository, ticket, stage lineage, and revision match. Checkpoints are data blobs, never extracted or executed on the supervisor host. A lost lease invalidates the old guest's proxy grants before another claim can proceed.
+
+## Isolation and credentials
+
+Give each guest its own kernel, process namespace, virtual disk, and ephemeral identity. Mount no host directory or socket. Use a read-only pinned system image, a writable job disk, and temporary secret storage erased at teardown. Limit CPU, memory, disk, process count, runtime, and checkpoint size. Build dependencies into the image so checks do not require unrestricted package downloads. Disable guest access to host services and metadata endpoints.
+
+Guest networking has no direct route. A host-enforced proxy permits only versioned, documented destinations for the selected provider and the active repository's HTTPS GitHub operations. It rejects arbitrary domains and IPs, private and link-local addresses, host services, DNS rebinding, alternate ports, and redirects outside policy. The supervisor, rather than the guest, talks to the control API. Proxy grants are bound to job ID and fencing token and are revoked on claim loss. Discover and document the exact destinations in staging; an unknown destination fails closed.
+
+Inject only the selected provider's required credential and, during authorized GitHub operations, a short-lived token restricted to the active repository and permissions supported by GitHub. The threat-model stage receives a token for its model repository only. Keep credentials out of Git remotes, checkpoints, command arguments, results, and logs. If a provider's subscription credential cannot be narrowed to one job, expose it to only that guest, document its scope and residual risk, and do not claim full mitigation until the deployed risk is reviewed. Never place administrator or unrelated credentials in the guest.
+
+## Interfaces and data models
+
+Add a versioned `IsolationPolicy` to worker deployment configuration: guest image digest, hypervisor requirements, resource limits, approved mount manifest, per-stage network destination sets, credential grants, checkpoint limits, and failure behavior. Repository policy may select an approved profile but cannot relax host enforcement. Reject missing, malformed, or unapproved profiles.
+
+Define a `JobEnvelope` for the private guest protocol containing job ID, ticket ID, stage, revision, fencing token, repository identity, expected checkout revision, policy digest, and bounded task data. Define a `GuestResult` with stage output, check summaries, checkout commit, checkpoint digest, and error class. Treat every guest field as untrusted and validate size and schema before using it.
+
+Persist a supervisor-created `IsolationRecord` linked to `Job`: boundary ID, image and policy digests, active repository and checkout revision, mount-manifest digest, credential grant identifiers without values, egress profile, start and teardown times, checkpoint digest, and outcome. Add a per-ticket, per-repository checkpoint manifest with lineage, size, digest, and retention deadline. Existing job revisions, fencing, audit events, and security approvals remain the source of lifecycle authority. Do not accept a guest-authored assertion that isolation was applied.
+
+## Failure handling and observability
+
+VM launch, mount, proxy, credential, or policy failures produce a classified job failure and trusted audit record without starting a CLI. Timeout, pause, or lost claim revokes proxy grants, stops the entire VM, and yields or fails the job through existing lifecycle rules. Failed checkpoint validation starts from the last durable approved state only after recording the reason; it must not import files from a different job. Reconcile GitHub branch or PR state before repeating an external side effect after retry. Preserve current-revision threat verification and approval, required checks, PR review, repository merge opt-in, and GitHub protection checks.
+
+Emit structured events for policy validation, guest creation, denied mount or egress attempts, credential issue and revocation, checkpoint save and restore, claim loss, and verified teardown. Correlate them by job, boundary, policy digest, and fencing token. Keep secret values and raw potentially sensitive command output out of central logs; retain bounded, redacted diagnostic artifacts with access controls.
+
+## Verification and control status
+
+Unit tests cover policy rejection, stage-specific grants, guest protocol validation, checkpoint lineage and size, and fencing. Deployment integration tests use a hostile issue and repository fixture that attempts to read and change host canaries, sibling checkout files, administrator credentials, and another worker's process data; each attempt must fail and canaries remain unchanged. Test arbitrary internet, private-network, and host-service egress denial while approved provider and repository destinations work. Repeat after pause, restart, retry, and provider fallback, then run a normal ticket through required checks and PR handoff. Capture the deployed VM and proxy configuration digests, denial events, test results, and normal-ticket trace. An invalid or absent policy must produce a reviewable failure without guest execution.
+
+No blocking security findings were listed. The issue's outstanding `ISOLATE_UNTRUSTED_WORK` control is addressed by the VM, network, credential, and verification design above. `MARK_UNTRUSTED_INPUT` remains a source-baseline claim requiring effectiveness review. Keep `fullyMitigated: false` until deployment evidence is linked in issue #1, the threat's `ticketLink` and control status are reconciled in Bturbs/Threat-Models, root-model verification passes, and reviewers find no material boundary gap. Active-checkout changes and malicious PR content remain possible within the authorized job scope and continue through the existing security and review gates.

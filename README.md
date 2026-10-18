@@ -12,7 +12,7 @@ The skill is repository scoped. To plan work in another repository, copy `.agent
 
 ## Start locally
 
-Requires Docker, Python 3.12+, Git, GitHub CLI, and at least one authenticated coding CLI. A configured root threat-model YAML and local `corda/threat-model-tool` checkout with `npm install` are required for security design approval.
+Requires Docker, Python 3.12+, and a deployed disposable-VM supervisor. Git, GitHub CLI, provider CLIs, the verifier, and their credentials belong in the pinned guest image, not on the dispatcher. A configured root threat-model YAML and verifier checkout are required in that image for security design approval.
 
 ```bash
 cp .env.example .env
@@ -37,7 +37,7 @@ After setup, start the local control services with `./scripts/start.sh --control
 
 ### Stop and resume safely
 
-Press **Ctrl-C once** in a local worker terminal to stop its active CLI, return the unfinished job to the queue, and exit. A normal SIGTERM from a process manager follows the same path. Restart with the same `worker_id` and checkout to pick up the yielded job; another host cannot claim it accidentally. Completed stages remain recorded, and files already written in the issue worktree remain available. An interrupted model response itself starts again, so only completed stages and saved files are durable checkpoints.
+Press **Ctrl-C once** in a dispatcher terminal to revoke the active guest, return the unfinished job to the queue, and exit. A normal SIGTERM from a process manager follows the same path. Restart with the same `worker_id` to pick up the yielded job; another host cannot claim it accidentally. The VM supervisor may restore only its bounded, lineage-checked checkpoint into a new guest. An interrupted model response itself starts again.
 
 To pause the whole system, export the existing `CONTROL_TOKEN` in your shell, then run:
 
@@ -58,6 +58,7 @@ When `allow_risk_acceptance` is explicitly enabled, a human can record a scoped,
 
 To opt a repository into automatic merging, set `auto_merge: true` when registering it and configure nonempty `required_ci_checks`. The control plane compares the PR head with the validated commit and submits GitHub's asynchronous merge request only if all policy checks pass. It records `MERGED` after GitHub confirms the final state. GitHub branch protection must be configured separately. High-risk changed paths require `POST /tickets/{id}/approve-high-risk-merge` after QA and security review; that approval is tied to the exact commit.
 
+CLI subscriptions have limits and are distinct from API billing. This version never falls back to a paid API. Each CLI must be installed and authenticated separately inside the guest image. The control plane stores only the selected provider name and reported usage metadata.
 CLI subscriptions have limits and are distinct from API billing. This version never falls back to a paid API. Each CLI must be installed and authenticated under the VM's untrusted agent identity. The control plane stores only the selected provider name and reported usage metadata.
 
 For hybrid deployment, host the control service behind HTTPS, set `HYBRID_MODE=true`, and issue each worker a scoped credential. Signed GitHub webhooks can trigger faster reconciliation while scheduled polling remains active. See [configuration](docs/CONFIGURATION.md) and [operations](docs/OPERATIONS.md).

@@ -131,9 +131,11 @@ async def test_worker_creates_reusable_issue_worktree_and_specs(tmp_path, monkey
     monkeypatch.setattr(worker, "candidate_runtimes", lambda policy, stage: [FakeRuntime()])
     config = {"repositories": {"example/project": {"path": str(repo), "worktrees": str(tmp_path / "worktrees")}}}
     base = {"repository": {"full_name": "example/project", "policy": {}}, "ticket": {"number": 5, "title": "Feature", "body": "Do work", "artifacts": {}, "findings": []}}
-    requirements = await worker.execute_job({**base, "stage": "product_owner"}, config)
+    # The workload implementation runs inside the guest image; the public
+    # worker entrypoint dispatches to a VM supervisor and has no host fallback.
+    requirements = await worker._execute_guest_job({**base, "stage": "product_owner"}, config)
     assert requirements["requirements"].startswith("# Requirements")
-    design = await worker.execute_job({**base, "stage": "architect"}, config)
+    design = await worker._execute_guest_job({**base, "stage": "architect"}, config)
     assert design["tasks"].startswith("# Tasks")
     spec = tmp_path / "worktrees" / "issue-5" / "specs" / "ISSUE-5"
     assert (spec / "requirements.md").exists()
