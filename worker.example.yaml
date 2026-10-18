@@ -8,6 +8,8 @@ repositories:
   example/project:
     path: /absolute/path/to/local/project
     worktrees: /absolute/path/to/adp-worktrees
+    # Preload a check image with project dependencies; checks fail closed without a digest.
+    check_image: example/checks@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     threat_root_model: threatModels/Project/Project.yaml
     # For models kept in a separate repository, use this instead of threat_root_model:
     # threat_repository:
