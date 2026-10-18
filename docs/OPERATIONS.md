@@ -10,6 +10,12 @@ If startup reports a saved pause, run `./scripts/start.sh --resume` when ready. 
 
 For hybrid mode, terminate HTTPS at a trusted reverse proxy, set `HYBRID_MODE=true`, configure a GitHub App installation and webhook secret, then issue a distinct worker credential for each worker. Workers connect outbound to the HTTPS URL. The scheduler keeps GitHub state reconciled and jobs queued while workers are offline.
 
+### Local HTTPS worker-channel exercise
+
+On a Mac staging host, keep the control API on its existing loopback port and start the optional TLS proxy with `docker compose -f compose.yaml -f compose.local-tls.yaml up -d worker_tls`. The proxy listens only on `127.0.0.1:8443` and forwards `/jobs/claim`, worker heartbeat/yield/complete routes, and `/health`; it returns 404 for administrative routes. It uses Caddy's private local CA for this loopback exercise. Export only the public root certificate with `./scripts/export-local-worker-ca.sh`, then set `SSL_CERT_FILE` to that path for a test worker using `https://127.0.0.1:8443`. Do not disable certificate verification or add this test CA to system-wide trust. Store the worker credential separately from the admin token.
+
+Confirm that a request with the exported CA succeeds, the same request without it fails certificate validation, cleartext remote URLs are rejected before a worker sends its token, and an administrative endpoint returns 404 through the proxy. This loopback proxy is staging evidence only. A remote worker deployment needs a DNS name and trusted certificate, network allowlisting, `HYBRID_MODE=true`, an issued scoped worker credential, and a claim/completion exercise through that exact external route. Keep the API's direct admin port private.
+
 For backlog planning, run `$github-spec-workflow` from a Codex session in the target checkout. The skill reads existing issues before writing and uses that host's `gh` login. Check the proposed ticket map in chat. If the repository is already registered, a new visible issue is picked up on the next poll. Editing an unmerged issue cancels queued/running work, clears its security design approval, and starts requirements replanning. If the repository uses `project_id`, confirm new issues are in the Project; an issue outside it will not be ingested.
 
 ## Pause and recover

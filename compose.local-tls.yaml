@@ -1,0 +1,16 @@
+services:
+  worker_tls:
+    image: caddy:2.10.2-alpine
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./deploy/local-tls/Caddyfile:/etc/caddy/Caddyfile:ro
+      - worker_tls_data:/data
+      - worker_tls_config:/config
+    depends_on:
+      control:
+        condition: service_healthy
+
+volumes:
+  worker_tls_data:
+  worker_tls_config:
