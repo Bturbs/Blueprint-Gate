@@ -3,7 +3,9 @@ set -euo pipefail
 
 destination="${1:-${XDG_CONFIG_HOME:-$HOME/.config}/blueprint-gate/local-worker-ca.crt}"
 directory="$(dirname "$destination")"
-install -d -m 700 "$directory"
+if [[ ! -d "$directory" ]]; then
+  install -d -m 700 "$directory"
+fi
 temporary="$(mktemp "$directory/.local-worker-ca-XXXXXXXX")"
 trap 'rm -f "$temporary"' EXIT
 

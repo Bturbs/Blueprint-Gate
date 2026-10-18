@@ -2,7 +2,7 @@
 from urllib.parse import urlsplit
 
 
-def control_origin(value: str) -> str:
+def control_origin(value: str, *, allow_container_control: bool = False) -> str:
     if not isinstance(value, str):
         raise ValueError("Control URL must contain only an origin")
     parsed = urlsplit(value)
@@ -14,6 +14,8 @@ def control_origin(value: str) -> str:
             or parsed.query or parsed.fragment or parsed.path not in ("", "/")
             or not parsed.netloc or port == 0):
         raise ValueError("Control URL must contain only an origin")
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}):
+    local_http = parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}
+    container_http = allow_container_control and value.rstrip("/") == "http://control:8000"
+    if parsed.scheme != "https" and not (local_http or container_http):
         raise ValueError("Remote control plane requires HTTPS")
     return f"{parsed.scheme}://{parsed.netloc}"

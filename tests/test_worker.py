@@ -45,6 +45,11 @@ def test_control_origin_preserves_valid_local_and_tls_urls():
     assert control_origin("http://127.0.0.1:8000/") == "http://127.0.0.1:8000"
     assert control_origin("http://localhost:8000") == "http://localhost:8000"
     assert control_origin("https://gate.example:8443/") == "https://gate.example:8443"
+    assert control_origin("http://control:8000", allow_container_control=True) == "http://control:8000"
+    with pytest.raises(ValueError):
+        control_origin("http://control:8000")
+    with pytest.raises(ValueError):
+        control_origin("http://control.attacker.example:8000", allow_container_control=True)
 
 
 @pytest.mark.asyncio
