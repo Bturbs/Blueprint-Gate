@@ -1,4 +1,4 @@
-https://127.0.0.1:8443 {
+https://localhost:8443 {
     tls internal
 
     @worker path /health /jobs/claim /jobs/*/heartbeat /jobs/*/yield /jobs/*/complete
