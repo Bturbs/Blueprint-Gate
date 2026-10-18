@@ -6,6 +6,7 @@ import fcntl
 import grp
 import os
 import signal
+import ssl
 import sys
 from contextlib import nullcontext
 from importlib.resources import files
@@ -26,6 +27,18 @@ from adp.control_url import control_origin
 from adp.threat_models import committed_model_revision, in_place_controls, model_revision, reject_unverified_controls, verify
 
 HEARTBEAT_SECONDS = 10
+
+
+def control_tls_verify(config: dict, origin: str) -> bool | ssl.SSLContext:
+    bundle = config.get("control_ca_bundle")
+    if bundle is None:
+        return True
+    if not isinstance(bundle, str) or not bundle or not origin.startswith("https://"):
+        raise ValueError("Control CA bundle requires an HTTPS control URL")
+    path = Path(bundle).expanduser()
+    if not path.is_absolute() or path.is_symlink() or not path.is_file() or path.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ValueError("Control CA bundle must be an absolute, private, non-writable file")
+    return ssl.create_default_context(cafile=str(path))
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -634,6 +647,7 @@ async def _record_publication_intent(client: httpx.AsyncClient, job: dict, worke
 async def run_worker(config_path: Path, once: bool = False):
     config = yaml.safe_load(config_path.read_text())
     base = control_origin(config["control_url"])
+    tls_verify = control_tls_verify(config, base)
     token_env = config.get("worker_token_env")
     if not token_env or "worker_token" in config:
         raise ValueError("Configure worker_token_env without an inline worker_token")
@@ -650,7 +664,7 @@ async def run_worker(config_path: Path, once: bool = False):
     os.environ.pop(token_env, None)
     headers = {"Authorization": f"Bearer {token}"}
     worker_id = config.get("worker_id", "local-worker")
-    async with httpx.AsyncClient(base_url=base, headers=headers, timeout=30) as client:
+    async with httpx.AsyncClient(base_url=base, headers=headers, timeout=30, verify=tls_verify) as client:
         try:
             while True:
                 response = await client.post("/jobs/claim", json={"worker_id": worker_id, "capabilities": config.get("capabilities", [])})

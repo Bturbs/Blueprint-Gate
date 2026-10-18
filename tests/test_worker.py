@@ -54,6 +54,20 @@ def test_control_origin_preserves_valid_local_and_tls_urls():
         control_origin("http://control.attacker.example:8000", allow_container_control=True)
 
 
+def test_worker_loads_private_ca_from_config_after_group_switch(tmp_path, monkeypatch):
+    ca = tmp_path / "control-root.crt"
+    ca.write_text("test-root")
+    ca.chmod(0o600)
+    context = object()
+    monkeypatch.setattr(worker.ssl, "create_default_context", lambda *, cafile: context if cafile == str(ca) else None)
+    assert worker.control_tls_verify({"control_ca_bundle": str(ca)}, "https://localhost:8443") is context
+    with pytest.raises(ValueError):
+        worker.control_tls_verify({"control_ca_bundle": str(ca)}, "http://localhost:8000")
+    ca.chmod(0o666)
+    with pytest.raises(ValueError):
+        worker.control_tls_verify({"control_ca_bundle": str(ca)}, "https://localhost:8443")
+
+
 def test_provider_prompt_uses_only_stage_context():
     sentinel = "UNRELATED_PRIVATE_VALUE"
     job = {
