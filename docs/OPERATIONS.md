@@ -36,13 +36,18 @@ If a yielded worker host is permanently unavailable, an admin can inspect the jo
 
 ## Database backup
 
-Back up PostgreSQL before upgrades and regularly in production. For a local Compose installation, use a host shell with protected backup storage:
+Back up PostgreSQL before upgrades and regularly. On the local macOS staging host, `scripts/backup-postgres.sh` writes a verified custom-format dump under `~/.local/share/blueprint-gate/backups` with directory mode 0700 and file mode 0600. It retains dumps for 14 days by default. `BACKUP_DIR` and `BACKUP_RETENTION_DAYS` can be set for a different location and retention. The scripts target the local `aiworkflow-db-1` container by default; set `BLUEPRINT_GATE_DB_CONTAINER` if the Compose project uses another name. Run one backup and a separate database restore exercise manually:
 
 ```bash
-docker compose exec -T db pg_dump -U adp -Fc adp > adp-backup.dump
+backup="$(scripts/backup-postgres.sh)"
+scripts/test-postgres-restore.sh "$backup"
 ```
 
-Test restores on a separate database. Stop control and scheduler writes before restoring a primary database. Keep the GitHub App private key, webhook secret, admin token, and worker tokens in a separate secret store; database backups do not contain provider CLI credentials or raw worker tokens.
+To compare every restored core row with the live database, pause dispatch and stop the scheduler first, take a fresh backup, then run `COMPARE_LIVE=1 scripts/test-postgres-restore.sh "$backup"`. This requires writes to remain stopped during the comparison. The restore exercise creates a temporary PostgreSQL database, verifies the restored tables, and removes it. A normal restore check verifies schema and readability without assuming the live database has stayed unchanged since the dump.
+
+On macOS, `python3 scripts/install-local-backups.py` copies the scripts to `~/.local/share/blueprint-gate/bin` and installs launchd jobs for a daily 02:00 backup and Sunday 03:00 restore exercise. The copied scripts run from outside `Documents`, where macOS privacy controls can prevent a background launchd job from entering this checkout. The weekly check fails if the newest backup is older than 24 hours (`BACKUP_MAX_AGE_HOURS` can override this). Logs are under `~/.local/share/blueprint-gate/logs`. Inspect them after a missed run or failure. The staging recovery target is at most 24 hours of data loss from the last successful daily run and two hours to restore service, assuming this Mac and Docker remain available. Confirm the last successful timestamp; sleep, shutdown, or a failed run can exceed that target. Keep a verified copy on separately protected storage before relying on backups against host loss or a compromised host user. Mode 0700 local storage alone does not protect against either.
+
+For primary recovery, stop workers, control, and scheduler; retain the failed volume for investigation; create a fresh `adp` database; restore the selected dump with `pg_restore --exit-on-error --no-owner --no-acl`; then restart control and scheduler and inspect ticket, job, approval, audit, and exception state before resuming dispatch. Always perform the separate database restore exercise before replacing a primary database. Keep the GitHub App private key, webhook secret, admin token, and worker tokens in a separate secret store; database backups do not contain provider CLI credentials or raw worker tokens.
 
 ## Worker isolation
 
