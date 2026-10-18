@@ -33,7 +33,25 @@ curl -X POST http://127.0.0.1:8000/repositories \
 
 Copy `worker.example.yaml` to `worker.yaml`, set absolute local paths, export `ADP_WORKER_TOKEN`, then run `.venv/bin/adp worker --config worker.yaml`. This worker uses only outbound HTTP. For a remote control plane, use HTTPS and an issued worker credential. The worker creates `adp/issue-N` worktrees in the configured directory. `delivery_enabled` must be explicitly enabled before it will commit, push, and open an implementation PR.
 
-The control API has `GET /tickets` and `GET /tickets/{id}` for review. When a ticket enters `WAITING_SECURITY_APPROVAL`, a human with the separate control token can approve the current design revision via `POST /tickets/{id}/approve-security` with JSON `{"actor":"name","justification":"Reviewed design and threat model"}`. Blocking findings trigger up to three Architect revisions, then escalation. Issue dependencies use lines such as `Depends on #12` in the issue body. An issue label such as `provider:claude` overrides routing only if that provider is approved by the repository policy. `POST /control/pause` pauses new claims and merges; `POST /repositories/{id}/control/pause` pauses one repository.
+After setup, restart the local stack and worker with `./scripts/start.sh`. It reads the local worker token from `.env`, starts Docker Desktop on macOS if needed, waits for the control service, and runs the worker in the foreground. A saved pause remains in force; use `./scripts/start.sh --resume` only when you intend to resume work. Use `./scripts/start.sh --control-only` to start the services without a worker, or `./scripts/start.sh --worker-only` on a hybrid worker host with its scoped token already exported. See [reboot steps](docs/OPERATIONS.md).
+
+### Stop and resume safely
+
+Press **Ctrl-C once** in a local worker terminal to stop its active CLI, return the unfinished job to the queue, and exit. A normal SIGTERM from a process manager follows the same path. Restart with the same `worker_id` and checkout to pick up the yielded job; another host cannot claim it accidentally. Completed stages remain recorded, and files already written in the issue worktree remain available. An interrupted model response itself starts again, so only completed stages and saved files are durable checkpoints.
+
+To pause the whole system, export the existing `CONTROL_TOKEN` in your shell, then run:
+
+```bash
+.venv/bin/adp pause http://127.0.0.1:8000
+.venv/bin/adp control-status http://127.0.0.1:8000
+# When ready to continue:
+.venv/bin/adp resume http://127.0.0.1:8000
+.venv/bin/adp worker --config worker.yaml
+```
+
+`pause` stops new claims and merge submissions, asks active workers to yield, and waits up to 30 seconds for `running_jobs` to reach zero. Use `--repository-id ID` to pause one registered repository. If active jobs remain, the command exits with status 2; check again before shutting down. For hybrid mode, use the HTTPS control URL. [Recovery details](docs/OPERATIONS.md).
+
+The control API has `GET /tickets` and `GET /tickets/{id}` for review. When a ticket enters `WAITING_SECURITY_APPROVAL`, a human with the separate control token can approve the current design revision via `POST /tickets/{id}/approve-security` with JSON `{"actor":"name","justification":"Reviewed design and threat model"}`. Blocking findings trigger up to three Architect revisions, then escalation. Issue dependencies use lines such as `Depends on #12` in the issue body. An issue label such as `provider:claude` overrides routing only if that provider is approved by the repository policy. `POST /control/pause` and `POST /repositories/{id}/control/pause` stop new claims and merge submissions and request active workers to yield.
 
 When `allow_risk_acceptance` is explicitly enabled, a human can record a scoped, expiring exception for an escalated finding through `POST /tickets/{id}/accept-risk`. The request requires `threat_id`, `actor`, `justification`, `residual_risk`, `scope`, and `expires_at`. Expired exceptions or exceptions for a previous design/model revision do not satisfy the security gate. An exception never changes a threat-model control to `inPlace: true`.
 

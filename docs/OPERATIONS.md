@@ -4,13 +4,31 @@
 
 For local mode, set `.env` then run `docker compose up --build -d`. Use `docker compose ps`, `docker compose logs control`, and `docker compose logs scheduler` for process health. `GET /health` only reports API availability; also check scheduler logs and recent ticket/job states through `GET /tickets`.
 
+After a computer restart, run `./scripts/start.sh` from the repository. It starts Docker Desktop on macOS if necessary, runs `docker compose up --build -d`, waits for control health, checks the saved pause flag, and starts the host worker in the foreground. Keep that terminal open; one Ctrl-C asks the worker to yield its active job. The script uses `CONTROL_TOKEN` from `.env` for the status check and maps the local `.env` `WORKER_TOKEN` to the example worker's `ADP_WORKER_TOKEN` when that variable is not already set. It does not register repositories again or replace the PostgreSQL `postgres_data` volume. The scheduler rereads open GitHub issues and Project membership every 60 seconds; jobs, approvals, policy, and pause state come from the existing database. The script is a manual startup command, not a login item.
+
+If startup reports a saved pause, run `./scripts/start.sh --resume` when ready. That explicitly clears the global pause before starting the worker. `./scripts/start.sh --control-only` starts the local services without a worker. On a hybrid worker host, export its scoped worker token and run `./scripts/start.sh --worker-only`; this mode does not start Docker or load local `.env` credentials. Keep its `worker_id` and checkout paths stable. The script expects an installed `.venv/bin/adp` and a configured `worker.yaml` for modes that start a worker.
+
 For hybrid mode, terminate HTTPS at a trusted reverse proxy, set `HYBRID_MODE=true`, configure a GitHub App installation and webhook secret, then issue a distinct worker credential for each worker. Workers connect outbound to the HTTPS URL. The scheduler keeps GitHub state reconciled and jobs queued while workers are offline.
 
 For backlog planning, run `$github-spec-workflow` from a Codex session in the target checkout. The skill reads existing issues before writing and uses that host's `gh` login. Check the proposed ticket map in chat. If the repository is already registered, a new visible issue is picked up on the next poll. Editing an unmerged issue cancels queued/running work, clears its security design approval, and starts requirements replanning. If the repository uses `project_id`, confirm new issues are in the Project; an issue outside it will not be ingested.
 
 ## Pause and recover
 
-Use `POST /control/pause` or `POST /repositories/{id}/control/pause` with the admin token to stop new claims and merges. Inspect `GET /tickets/{id}` before retrying a failed job through `POST /jobs/{id}/retry`. Retry limits are configured by `max_job_attempts`. A stale worker lease is fenced by a new claim; the old worker cannot complete its job. If an asynchronous merge reaches `MERGE_FAILED` or `MERGE_UNKNOWN`, inspect GitHub and the PR before taking further action.
+For a local worker, press Ctrl-C once; a normal SIGTERM follows the same path. The worker asks its CLI process group to terminate, gives it five seconds to close files, then stops it if necessary. It releases the current job back to `QUEUED` with the same stage and revision and leaves the issue worktree in place. Restart with the same `worker_id` and checkout to continue. A yielded job keeps that worker affinity, preventing a different hybrid host from claiming work whose partial files it cannot see. Completed stages stay in the database. An interrupted stage reruns using existing worktree files; an incomplete model response is not a durable checkpoint.
+
+For all workers or one repository, export `CONTROL_TOKEN` in the shell and use the CLI:
+
+```bash
+adp pause http://127.0.0.1:8000
+adp control-status http://127.0.0.1:8000
+adp resume http://127.0.0.1:8000
+```
+
+Append `--repository-id ID` to scope any of these commands. Repository status also reports `global_paused`; a global pause still applies if the repository's own `paused` flag is false. Remote control URLs must use HTTPS. `pause` blocks new claims and merge submissions, signals running workers through their heartbeat, and waits up to 30 seconds for `running_jobs` to reach zero. It exits with status 2 when work has not drained. A merge request already submitted to GitHub may still complete while paused; inspect its PR if a full delivery halt is needed. After `resume`, restart any workers that exited on pause. The equivalent admin API endpoints are `POST /control/{pause|resume}`, `GET /control`, and their `/repositories/{id}/control` forms. A worker with a matching lease can release a job through `POST /jobs/{id}/yield`; stale fencing tokens are rejected.
+
+If the worker process or network disappears before it can yield, the job remains leased for up to 20 minutes. Once the lease expires and dispatch resumes, a worker can reclaim that same job with a new fencing token. Inspect `GET /tickets/{id}` before retrying a genuinely failed job through `POST /jobs/{id}/retry`; retry limits are configured by `max_job_attempts`. If an asynchronous merge reaches `MERGE_FAILED` or `MERGE_UNKNOWN`, inspect GitHub and the PR before taking further action.
+
+If a yielded worker host is permanently unavailable, an admin can inspect the job in `GET /tickets/{id}` and call `POST /jobs/{job_id}/release-affinity` after ensuring the old process has stopped. The next eligible worker may then claim the job from the last completed stage; partial files on the old host will not follow it. The release increments the fencing token and is recorded in the audit log.
 
 ## Database backup
 

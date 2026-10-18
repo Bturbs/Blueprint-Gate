@@ -28,6 +28,23 @@ class AgentRuntime(Protocol):
     async def get_usage_status(self) -> dict: ...
 
 
+async def _terminate_group(process: asyncio.subprocess.Process) -> None:
+    """Give the CLI time to close files, then ensure its process group is gone."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    await process.communicate()
+
+
 async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int) -> tuple[int, str, str]:
     process = await asyncio.create_subprocess_exec(
         *argv, cwd=cwd, stdin=asyncio.subprocess.PIPE,
@@ -37,18 +54,10 @@ async def _run(argv: list[str], prompt: str, cwd: Path, timeout: int) -> tuple[i
     try:
         out, err = await asyncio.wait_for(process.communicate(prompt.encode()), timeout)
     except asyncio.TimeoutError:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        await process.communicate()
+        await _terminate_group(process)
         return 124, "", "execution timeout"
     except asyncio.CancelledError:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        await process.communicate()
+        await _terminate_group(process)
         raise
     return process.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 

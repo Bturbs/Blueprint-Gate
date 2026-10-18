@@ -2,7 +2,7 @@
 
 Checked on 2026-10-18:
 
-- `pytest -q`: 20 passed, 2 skipped. The skipped tests require PostgreSQL and an explicitly configured staging GitHub repository/token; the PostgreSQL test runs in the supplied GitHub Actions workflow.
+- `pytest -q`: 34 passed, 2 skipped. The skipped tests require PostgreSQL and an explicitly configured staging GitHub repository/token; the PostgreSQL test runs in the supplied GitHub Actions workflow.
 - `alembic upgrade head`: reached revision `0006` using the local SQLite development database. A fresh SQLite migration also succeeded. PostgreSQL migration execution is configured in CI but could not be run locally because the Docker daemon is unavailable.
 - `docker compose config --quiet`: passed with placeholder tokens. Container startup was not verified because the Docker daemon is unavailable.
 - `CodexCLIRuntime` executed a read-only JSON smoke prompt through the installed authenticated `codex exec` CLI and returned a parsed result with usage metrics.
@@ -10,5 +10,7 @@ Checked on 2026-10-18:
 - Claude Code is not installed locally. Its adapter follows the [official Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference), but has not been exercised against a real CLI or subscription.
 - GitHub issue polling, Projects V2 GraphQL, GitHub App JWT/token cache, signed webhooks, threat PR review, and asynchronous merge submission were tested with mocks. They have not been run against a dedicated test repository.
 - The single `.agents/skills/github-spec-workflow` skill passed the Codex skill validator. `gh repo view` resolved `Bturbs/Blueprint-Gate`, and a read-only `gh issue list --state all` returned no issues. No live issue edits, issue creation, or Project membership changes were exercised.
+- Pause/yield tests covered global and repository pause signals, same-revision requeue, worker affinity and admin release, expired-lease reclaim and fencing, local worker cancellation with preserved worktree files, and graceful CLI process termination. The pause CLI was tested with mocked control responses; a live hybrid worker drain has not been exercised.
+- The startup script was tested with mocked Docker, health, and CLI commands for saved pause, explicit resume, and worker-only startup. A real post-reboot Docker Desktop startup has not been exercised.
 
 Separate threat-model repository Git operations, real GitHub App/Projects/merge queue, remote workers, and Claude execution remain unverified in a live environment. The worker's host-level execution isolation and production backup/monitoring are deployment responsibilities.

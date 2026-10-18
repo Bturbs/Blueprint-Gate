@@ -1,8 +1,11 @@
 import asyncio
 import json
+import os
 import shutil
+import signal
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import typer
@@ -24,8 +27,80 @@ def doctor():
 
 @app.command()
 def worker(config: Path = typer.Option(Path("worker.yaml"), help="Local worker configuration"), once: bool = False):
-    """Run a local worker against a local or remote control plane."""
-    asyncio.run(run_worker(config, once))
+    """Run a worker. Press Ctrl-C once to release its current job safely."""
+    async def serve():
+        loop = asyncio.get_running_loop()
+        current = asyncio.current_task()
+        previous = signal.getsignal(signal.SIGTERM)
+        installed = False
+        try:
+            loop.add_signal_handler(signal.SIGTERM, current.cancel)
+            installed = True
+        except (NotImplementedError, RuntimeError):
+            pass
+        try:
+            await run_worker(config, once)
+        finally:
+            if installed:
+                loop.remove_signal_handler(signal.SIGTERM)
+                signal.signal(signal.SIGTERM, previous)
+
+    asyncio.run(serve())
+
+
+def _control_client(control_url: str, token_env: str) -> httpx.Client:
+    parsed = urlsplit(control_url)
+    if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        raise typer.BadParameter("Control URL must contain only an origin")
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}):
+        raise typer.BadParameter("Remote control plane requires HTTPS")
+    token = os.environ.get(token_env)
+    if not token:
+        raise typer.BadParameter(f"Set {token_env} in the environment")
+    return httpx.Client(base_url=control_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+
+
+def _control_path(repository_id: str | None) -> str:
+    return f"/repositories/{repository_id}/control" if repository_id else "/control"
+
+
+@app.command()
+def pause(control_url: str, repository_id: str | None = typer.Option(None), token_env: str = typer.Option("CONTROL_TOKEN"), wait_seconds: int = typer.Option(30, min=0)):
+    """Stop new claims and ask active workers to yield, then wait for drain."""
+    path = _control_path(repository_id)
+    with _control_client(control_url, token_env) as client:
+        response = client.post(f"{path}/pause")
+        response.raise_for_status()
+        state = response.json()
+        deadline = time.monotonic() + wait_seconds
+        while state.get("running_jobs", 0) and time.monotonic() < deadline:
+            time.sleep(1)
+            response = client.get(path)
+            response.raise_for_status()
+            state = response.json()
+    typer.echo(json.dumps(state))
+    if state.get("running_jobs", 0):
+        typer.echo("Pause requested, but active jobs remain. Wait for workers to yield; a lost worker can be reclaimed after its lease expires and dispatch resumes.", err=True)
+        raise typer.Exit(2)
+
+
+@app.command()
+def resume(control_url: str, repository_id: str | None = typer.Option(None), token_env: str = typer.Option("CONTROL_TOKEN")):
+    """Allow queued jobs to be claimed again."""
+    path = _control_path(repository_id)
+    with _control_client(control_url, token_env) as client:
+        response = client.post(f"{path}/resume")
+        response.raise_for_status()
+        typer.echo(json.dumps(response.json()))
+
+
+@app.command("control-status")
+def control_status(control_url: str, repository_id: str | None = typer.Option(None), token_env: str = typer.Option("CONTROL_TOKEN")):
+    """Show whether dispatch is paused and how many jobs are still running."""
+    with _control_client(control_url, token_env) as client:
+        response = client.get(_control_path(repository_id))
+        response.raise_for_status()
+        typer.echo(json.dumps(response.json()))
 
 
 @app.command()

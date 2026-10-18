@@ -9,7 +9,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from adp.db import AuditEvent, ControlState, Job, Repository, RiskAcceptance, SessionLocal, Ticket, WebhookDelivery, WorkerCredential, now
@@ -72,6 +72,11 @@ class CompleteIn(BaseModel):
     succeeded: bool = True
 
 
+class YieldIn(BaseModel):
+    worker_id: str
+    fencing_token: int
+
+
 class ApprovalIn(BaseModel):
     actor: str = Field(min_length=2)
     justification: str = Field(min_length=10)
@@ -130,7 +135,8 @@ def health():
 @app.get("/control", dependencies=[Depends(authorized)])
 def control_state(db: Session = Depends(db_session)):
     state = db.get(ControlState, 1)
-    return {"paused": state.paused if state else False}
+    running = db.scalar(select(func.count()).select_from(Job).where(Job.state == "RUNNING")) or 0
+    return {"paused": state.paused if state else False, "running_jobs": running}
 
 
 @app.post("/control/{action}", dependencies=[Depends(authorized)])
@@ -144,7 +150,8 @@ def set_control_state(action: str, db: Session = Depends(db_session)):
     state.paused = action == "pause"
     db.add(AuditEvent(action="global_pause_changed", detail={"paused": state.paused}))
     db.commit()
-    return {"paused": state.paused}
+    running = db.scalar(select(func.count()).select_from(Job).where(Job.state == "RUNNING")) or 0
+    return {"paused": state.paused, "running_jobs": running}
 
 
 @app.post("/repositories", dependencies=[Depends(authorized)])
@@ -173,7 +180,19 @@ def set_repository_state(repo_id: str, action: str, db: Session = Depends(db_ses
     repo.paused = action == "pause"
     db.add(AuditEvent(action="repository_pause_changed", detail={"repository": repo.full_name, "paused": repo.paused}))
     db.commit()
-    return {"paused": repo.paused}
+    running = db.scalar(select(func.count()).select_from(Job).join(Ticket, Ticket.id == Job.ticket_id).where(Job.state == "RUNNING", Ticket.repository_id == repo_id)) or 0
+    global_state = db.get(ControlState, 1)
+    return {"paused": repo.paused, "global_paused": global_state.paused if global_state else False, "running_jobs": running}
+
+
+@app.get("/repositories/{repo_id}/control", dependencies=[Depends(authorized)])
+def repository_control_state(repo_id: str, db: Session = Depends(db_session)):
+    repo = db.get(Repository, repo_id)
+    if not repo:
+        raise HTTPException(404, "Repository not found")
+    running = db.scalar(select(func.count()).select_from(Job).join(Ticket, Ticket.id == Job.ticket_id).where(Job.state == "RUNNING", Ticket.repository_id == repo_id)) or 0
+    global_state = db.get(ControlState, 1)
+    return {"paused": repo.paused, "global_paused": global_state.paused if global_state else False, "running_jobs": running}
 
 
 @app.post("/repositories/{repo_id}/poll", dependencies=[Depends(authorized)])
@@ -292,7 +311,7 @@ def ticket_detail(ticket_id: str, db: Session = Depends(db_session)):
         "threat_revision": ticket.threat_revision, "verification_passed": ticket.verification_passed,
         "security_approved_revision": ticket.security_approved_revision,
         "findings": ticket.findings, "artifacts": ticket.artifacts,
-        "jobs": [{"id": j.id, "stage": j.stage, "revision": j.revision, "state": j.state, "provider": j.provider, "result": j.result} for j in jobs],
+        "jobs": [{"id": j.id, "stage": j.stage, "revision": j.revision, "state": j.state, "claimed_by": j.claimed_by, "provider": j.provider, "result": j.result} for j in jobs],
         "risk_acceptances": [
             {"threat_id": x.threat_id, "design_revision": x.design_revision, "threat_revision": x.threat_revision, "actor": x.actor, "justification": x.justification, "residual_risk": x.residual_risk, "scope": x.scope, "expires_at": x.expires_at}
             for x in db.scalars(select(RiskAcceptance).where(RiskAcceptance.ticket_id == ticket.id))
@@ -312,7 +331,10 @@ def claim(data: ClaimIn, credential: WorkerCredential | None = Depends(worker_au
         if global_state and global_state.paused:
             return None
         candidates = db.scalars(
-            select(Job).join(Ticket, Ticket.id == Job.ticket_id).where(or_(Job.state == "QUEUED", (Job.state == "RUNNING") & (Job.lease_expires_at < now())))
+            select(Job).join(Ticket, Ticket.id == Job.ticket_id).where(or_(
+                (Job.state == "QUEUED") & (or_(Job.claimed_by.is_(None), Job.claimed_by == data.worker_id)),
+                (Job.state == "RUNNING") & (Job.lease_expires_at < now()),
+            ))
             .order_by(Ticket.priority.desc(), Job.created_at, Job.id).with_for_update(of=Job, skip_locked=True).limit(100)
         ).all()
         for job in candidates:
@@ -345,8 +367,40 @@ def heartbeat(job_id: str, data: ClaimIn, fencing_token: int, credential: Worker
     if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != fencing_token:
         raise HTTPException(409, "Stale job claim")
     job.lease_expires_at = now() + timedelta(minutes=20)
+    ticket = db.get(Ticket, job.ticket_id)
+    global_state = db.get(ControlState, 1)
+    pause_requested = bool((global_state and global_state.paused) or ticket.repository.paused)
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "pause_requested": pause_requested}
+
+
+@app.post("/jobs/{job_id}/yield")
+def yield_job(job_id: str, data: YieldIn, credential: WorkerCredential | None = Depends(worker_authorized), db: Session = Depends(db_session)):
+    if credential and data.worker_id != credential.worker_id:
+        raise HTTPException(403, "Worker identity mismatch")
+    job = db.get(Job, job_id)
+    if not job or job.state != "RUNNING" or job.claimed_by != data.worker_id or job.fencing_token != data.fencing_token:
+        raise HTTPException(409, "Stale job claim")
+    job.state = "QUEUED"
+    # Keep claimed_by as worker affinity so a different host cannot discard partial files.
+    job.lease_expires_at = None
+    job.started_at = None
+    db.add(AuditEvent(ticket_id=job.ticket_id, action="job_yielded", detail={"job": job.id, "worker": data.worker_id, "revision": job.revision}))
+    db.commit()
+    return {"queued": True, "job_id": job.id}
+
+
+@app.post("/jobs/{job_id}/release-affinity", dependencies=[Depends(authorized)])
+def release_job_affinity(job_id: str, db: Session = Depends(db_session)):
+    job = db.get(Job, job_id)
+    if not job or job.state != "QUEUED" or not job.claimed_by:
+        raise HTTPException(409, "Job is not a yielded claim")
+    previous_worker = job.claimed_by
+    job.claimed_by = None
+    job.fencing_token += 1
+    db.add(AuditEvent(ticket_id=job.ticket_id, action="job_affinity_released", detail={"job": job.id, "previous_worker": previous_worker}))
+    db.commit()
+    return {"queued": True, "job_id": job.id, "previous_worker": previous_worker}
 
 
 @app.post("/jobs/{job_id}/complete")

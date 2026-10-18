@@ -1,6 +1,7 @@
 # Architectural decisions
 
 - PostgreSQL is the durable state store and queue. Jobs are claimed with row locks and fencing tokens; a later claim invalidates stale completion.
+- A safe stop yields the current job without changing its stage or revision. Completed stages live in the database; an interrupted stage restarts in the same issue worktree. Yielded jobs retain worker affinity because local partial files cannot move between hybrid hosts. A graceful CLI termination preserves files, while lease expiry is the fallback for abrupt loss.
 - GitHub Issues are ingested by outbound REST polling. Signed, deduplicated webhooks can reduce latency in hybrid mode; polling remains the recovery path.
 - The control plane stores no Codex or Claude credentials. CLI execution takes place in a host worker; routing is per repository and role.
 - Automated specifications are generated into an issue worktree and are committed with the eventual application PR. The security-design approval is recorded in the control plane before engineering.
