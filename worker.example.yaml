@@ -1,0 +1,17 @@
+control_url: http://127.0.0.1:8000
+worker_token_env: ADP_WORKER_TOKEN
+worker_id: my-laptop
+capabilities: [git, codex]
+poll_seconds: 5
+threat_tool_root: /absolute/path/to/threat-model-tool
+repositories:
+  example/project:
+    path: /absolute/path/to/local/project
+    worktrees: /absolute/path/to/adp-worktrees
+    threat_root_model: threatModels/Project/Project.yaml
+    # For models kept in a separate repository, use this instead of threat_root_model:
+    # threat_repository:
+    #   full_name: example/threat-models
+    #   path: /absolute/path/to/threat-models
+    #   worktrees: /absolute/path/to/threat-worktrees
+    #   root_model: threatModels/Project/Project.yaml

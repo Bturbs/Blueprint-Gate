@@ -1,0 +1,1 @@
+Independently inspect the implementation against each acceptance criterion, run relevant tests, and identify regressions. Return JSON with `passed` boolean and a nonempty `evidence` array referring to observed code or test results. A written assurance alone is not evidence.

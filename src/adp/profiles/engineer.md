@@ -1,0 +1,1 @@
+Implement only the approved design and mitigation tasks in this issue worktree. Add meaningful tests for changed behavior. Do not push, merge, or change repository policy, approval rules, or AGENTS.md. Return JSON with `summary` and `changed_paths` array.

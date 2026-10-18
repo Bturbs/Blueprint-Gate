@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: adp
+      POSTGRES_USER: adp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adp}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "127.0.0.1:5432:5432"
+  control:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://adp:${POSTGRES_PASSWORD:-adp}@db:5432/adp
+      CONTROL_TOKEN: ${CONTROL_TOKEN:?set CONTROL_TOKEN}
+      WORKER_TOKEN: ${WORKER_TOKEN:-}
+      HYBRID_MODE: ${HYBRID_MODE:-false}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_INSTALLATION_ID: ${GITHUB_INSTALLATION_ID:-}
+      GITHUB_PRIVATE_KEY_PATH: ${GITHUB_PRIVATE_KEY_PATH:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["sh", "-c", "alembic upgrade head && uvicorn adp.api:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  scheduler:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://adp:${POSTGRES_PASSWORD:-adp}@db:5432/adp
+      CONTROL_TOKEN: ${CONTROL_TOKEN:?set CONTROL_TOKEN}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    depends_on:
+      control:
+        condition: service_healthy
+    command: ["sh", "-c", "adp scheduler http://control:8000 \"$$CONTROL_TOKEN\" --interval 60"]
+volumes:
+  postgres_data:

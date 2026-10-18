@@ -1,0 +1,1 @@
+Refine the issue into requirements. Include business context, functional and non-functional requirements, assumptions, exclusions, and testable acceptance criteria. Return JSON with a nonempty `requirements` Markdown string. Do not implement code.
