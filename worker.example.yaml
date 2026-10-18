@@ -1,6 +1,8 @@
 control_url: http://127.0.0.1:8000
 worker_token_env: ADP_WORKER_TOKEN
 worker_id: my-laptop
+untrusted_user: blueprint-agent
+untrusted_group: blueprint-work
 capabilities: [git, codex]
 poll_seconds: 5
 threat_tool_root: /absolute/path/to/threat-model-tool
@@ -8,8 +10,8 @@ repositories:
   example/project:
     path: /absolute/path/to/local/project
     worktrees: /absolute/path/to/adp-worktrees
-    # Preload a check image with project dependencies; checks fail closed without a digest.
-    check_image: example/checks@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    # Preload a check image in the VM's own Docker daemon. A local sha256 image ID is accepted.
+    check_image: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     threat_root_model: threatModels/Project/Project.yaml
     # For models kept in a separate repository, use this instead of threat_root_model:
     # threat_repository:

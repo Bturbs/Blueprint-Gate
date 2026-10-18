@@ -185,6 +185,7 @@ async def test_worker_interruption_yields_claim_and_reuses_worktree(control, tmp
     config_path = tmp_path / "worker.yaml"
     config_path.write_text(yaml.safe_dump({"control_url": "http://127.0.0.1:8000", "worker_token_env": "ADP_WORKER_TOKEN", "worker_id": "w1", "repositories": {"example/project": {"path": str(repo), "worktrees": str(tmp_path / "worktrees")}}}))
     monkeypatch.setenv("ADP_WORKER_TOKEN", token)
+    monkeypatch.setattr(worker, "_assert_isolated_worker", lambda config: None)
     real_client = httpx.AsyncClient
     monkeypatch.setattr(worker.httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.ASGITransport(app=api.app), **kwargs))
     started = asyncio.Event()

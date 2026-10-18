@@ -1,6 +1,6 @@
 # Blueprint Gate
 
-Blueprint Gate turns GitHub issues into policy-gated software delivery. It runs a FastAPI/PostgreSQL control plane in Docker and Codex or Claude Code workers on the host. It supports GitHub Projects, separate threat-model PRs, asynchronous merge requests, and scoped outbound hybrid workers. See [implementation status and validation limits](docs/IMPLEMENTATION_PLAN.md).
+Blueprint Gate turns GitHub issues into policy-gated software delivery. It runs a FastAPI/PostgreSQL control plane in Docker and coding workers in dedicated Linux VMs. It supports GitHub Projects, separate threat-model PRs, asynchronous merge requests, and scoped outbound hybrid workers. See [implementation status and validation limits](docs/IMPLEMENTATION_PLAN.md).
 
 ## Plan work with one skill
 
@@ -31,9 +31,9 @@ curl -X POST http://127.0.0.1:8000/repositories \
 .venv/bin/adp poll http://127.0.0.1:8000 "$CONTROL_TOKEN" REPOSITORY_ID
 ```
 
-Issue a scoped worker credential through `POST /workers/credentials` with a future `expires_at` (up to 30 days), then copy `worker.example.yaml` to `worker.yaml`, set absolute local paths, export the returned token as `ADP_WORKER_TOKEN`, and run `.venv/bin/adp worker --config worker.yaml`. The raw token is returned once. This worker uses only outbound HTTP. For a remote control plane, use HTTPS. The worker creates `adp/issue-N` worktrees in the configured directory. `delivery_enabled` must be explicitly enabled before it will commit, push, and open an implementation PR.
+Issue a scoped worker credential through `POST /workers/credentials` with a future `expires_at` (up to 30 days), then provision a dedicated Linux VM following [worker isolation](docs/WORKER-ISOLATION.md). The worker refuses to claim jobs on the Mac account or in an ordinary container. The raw token is returned once. For a remote control plane, use HTTPS. The worker creates `adp/issue-N` worktrees in the VM. `delivery_enabled` must be explicitly enabled before it will commit, push, and open an implementation PR.
 
-After setup, export the issued `ADP_WORKER_TOKEN` and restart the local stack and worker with `./scripts/start.sh`. It starts Docker Desktop on macOS if needed, waits for the control service, and runs the worker in the foreground. A saved pause remains in force; use `./scripts/start.sh --resume` only when you intend to resume work. Use `./scripts/start.sh --control-only` to start the services without a worker, or `./scripts/start.sh --worker-only` on a hybrid worker host with its scoped token already exported. See [reboot steps](docs/OPERATIONS.md).
+After setup, start the local control services with `./scripts/start.sh --control-only`, then start the dedicated VM worker. A saved pause remains in force; use `.venv/bin/adp resume http://127.0.0.1:8000` only when you intend to resume work. See [worker isolation](docs/WORKER-ISOLATION.md) and [reboot steps](docs/OPERATIONS.md).
 
 ### Stop and resume safely
 
@@ -46,7 +46,8 @@ To pause the whole system, export the existing `CONTROL_TOKEN` in your shell, th
 .venv/bin/adp control-status http://127.0.0.1:8000
 # When ready to continue:
 .venv/bin/adp resume http://127.0.0.1:8000
-.venv/bin/adp worker --config worker.yaml
+# In the dedicated VM, with its scoped worker credential:
+scripts/run-worker-vm.sh
 ```
 
 `pause` stops new claims and merge submissions, asks active workers to yield, and waits up to 30 seconds for `running_jobs` to reach zero. Use `--repository-id ID` to pause one registered repository. If active jobs remain, the command exits with status 2; check again before shutting down. For hybrid mode, use the HTTPS control URL. [Recovery details](docs/OPERATIONS.md).
@@ -57,7 +58,7 @@ When `allow_risk_acceptance` is explicitly enabled, a human can record a scoped,
 
 To opt a repository into automatic merging, set `auto_merge: true` when registering it and configure nonempty `required_ci_checks`. The control plane compares the PR head with the validated commit and submits GitHub's asynchronous merge request only if all policy checks pass. It records `MERGED` after GitHub confirms the final state. GitHub branch protection must be configured separately. High-risk changed paths require `POST /tickets/{id}/approve-high-risk-merge` after QA and security review; that approval is tied to the exact commit.
 
-CLI subscriptions have limits and are distinct from API billing. This version never falls back to a paid API. Each CLI must be installed and authenticated separately on the worker host. The control plane stores only the selected provider name and reported usage metadata.
+CLI subscriptions have limits and are distinct from API billing. This version never falls back to a paid API. Each CLI must be installed and authenticated under the VM's untrusted agent identity. The control plane stores only the selected provider name and reported usage metadata.
 
 For hybrid deployment, host the control service behind HTTPS, set `HYBRID_MODE=true`, and issue each worker a scoped credential. Signed GitHub webhooks can trigger faster reconciliation while scheduled polling remains active. See [configuration](docs/CONFIGURATION.md) and [operations](docs/OPERATIONS.md).
 

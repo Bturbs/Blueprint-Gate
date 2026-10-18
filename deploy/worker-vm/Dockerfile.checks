@@ -1,0 +1,4 @@
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml /tmp/pyproject.toml
+RUN python -c 'import subprocess,sys,tomllib; p=tomllib.load(open("/tmp/pyproject.toml", "rb")); subprocess.check_call([sys.executable,"-m","pip","install","--no-cache-dir",*p["project"]["dependencies"],*p["project"]["optional-dependencies"]["test"]])'
