@@ -1,4 +1,6 @@
 control_url: http://127.0.0.1:8000
+# For a private HTTPS worker proxy, set an absolute path to its trusted CA PEM.
+# control_ca_bundle: /home/worker/.config/blueprint-gate/control-root.crt
 worker_token_env: ADP_WORKER_TOKEN
 worker_id: my-laptop
 untrusted_user: blueprint-agent
