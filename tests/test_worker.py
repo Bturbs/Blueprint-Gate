@@ -3,9 +3,11 @@ import json
 import subprocess
 
 import pytest
+import yaml
 
 from adp import worker
 from adp.runtimes import RuntimeResult
+from adp.control_url import control_origin
 
 
 class FakeRuntime:
@@ -20,6 +22,29 @@ class FakeRuntime:
         else:
             output = {"design": "# Design\nUse a service.", "tasks": "# Tasks\nImplement service."}
         return RuntimeResult("codex", "succeeded", json.dumps(output), {})
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:8000@attacker.example",
+    "http://localhost:8000@attacker.example",
+    "http://attacker.example:8000",
+    "https://user:secret@example.com",
+    "https://example.com/jobs/claim",
+    "https://example.com?token=secret",
+])
+@pytest.mark.asyncio
+async def test_worker_rejects_unsafe_control_origin_before_sending_token(tmp_path, monkeypatch, url):
+    monkeypatch.setenv("ADP_WORKER_TOKEN", "worker-secret")
+    config = tmp_path / "worker.yaml"
+    config.write_text(yaml.safe_dump({"control_url": url, "worker_token_env": "ADP_WORKER_TOKEN"}))
+    with pytest.raises(ValueError):
+        await worker.run_worker(config, once=True)
+
+
+def test_control_origin_preserves_valid_local_and_tls_urls():
+    assert control_origin("http://127.0.0.1:8000/") == "http://127.0.0.1:8000"
+    assert control_origin("http://localhost:8000") == "http://localhost:8000"
+    assert control_origin("https://gate.example:8443/") == "https://gate.example:8443"
 
 
 @pytest.mark.asyncio
@@ -43,4 +68,3 @@ async def test_worker_creates_reusable_issue_worktree_and_specs(tmp_path, monkey
     assert (spec / "requirements.md").exists()
     assert (spec / "design.md").exists()
     assert (spec / "tasks.md").exists()
-

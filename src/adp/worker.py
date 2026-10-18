@@ -17,6 +17,7 @@ import yaml
 
 from adp.runtimes import _run, candidate_runtimes
 from adp.process_env import child_environment
+from adp.control_url import control_origin
 from adp.threat_models import in_place_controls, reject_unverified_controls, verify
 
 HEARTBEAT_SECONDS = 10
@@ -318,9 +319,7 @@ async def _yield_claim(client: httpx.AsyncClient, job: dict, worker_id: str) -> 
 
 async def run_worker(config_path: Path, once: bool = False):
     config = yaml.safe_load(config_path.read_text())
-    base = config["control_url"].rstrip("/")
-    if not (base.startswith("https://") or base.startswith("http://127.0.0.1:") or base.startswith("http://localhost:")):
-        raise ValueError("Remote control plane requires HTTPS")
+    base = control_origin(config["control_url"])
     token_env = config.get("worker_token_env")
     if not token_env or "worker_token" in config:
         raise ValueError("Configure worker_token_env without an inline worker_token")
