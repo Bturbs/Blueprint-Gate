@@ -58,6 +58,8 @@ Set `GITHUB_TOKEN` only for local control-plane GitHub operations. Hybrid mode r
 
 For a Compose deployment using the App, set `GITHUB_APP_ID`, `GITHUB_INSTALLATION_ID`, and `GITHUB_APP_PRIVATE_KEY_FILE` (an absolute host path to the PEM file), leave `GITHUB_TOKEN` empty, and run `docker compose -f compose.yaml -f compose.github-app.yaml up -d --build`. The overlay sets hybrid mode, removes the personal token from the control container environment, and mounts the PEM read-only at `GITHUB_PRIVATE_KEY_PATH`. Keep the PEM outside repository checkouts and readable only by the operator and control container.
 
+For restarts through `scripts/start.sh`, set `GITHUB_APP_PRIVATE_KEY_FILE` in `.env` or the shell; the script selects the App overlay automatically. If using the separate local TLS overlay, set `BLUEPRINT_LOCAL_TLS=true` as well. The script rejects a missing PEM or TLS overlay before starting Compose.
+
 For a GitHub App installation, select only the application and threat-model repositories registered with Blueprint Gate. Use this permission budget and remove conditional permissions when the corresponding feature is disabled:
 
 | Process | Permission | When required |
