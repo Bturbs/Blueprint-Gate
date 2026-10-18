@@ -15,11 +15,20 @@ class GitHubTokenProvider:
         self._cached: tuple[str, datetime] | None = None
         self._lock = asyncio.Lock()
 
-    async def get(self) -> str:
+    async def get(self, override: str | None = None) -> str:
+        app_fields = (settings.github_app_id, settings.github_installation_id, settings.github_private_key_path)
+        if settings.hybrid_mode and (settings.github_token or override):
+            raise RuntimeError("Hybrid control must not use a personal GitHub token")
+        if (settings.github_token or override) and any(app_fields):
+            raise RuntimeError("GitHub App control must not use a personal GitHub token")
+        if any(app_fields) and not all(app_fields):
+            raise RuntimeError("Complete GitHub App configuration required")
+        if override:
+            return override
         if settings.github_token:
             return settings.github_token
-        if not all((settings.github_app_id, settings.github_installation_id, settings.github_private_key_path)):
-            raise RuntimeError("GitHub token or complete GitHub App configuration required")
+        if not all(app_fields):
+            raise RuntimeError("Complete GitHub App configuration required in hybrid mode" if settings.hybrid_mode else "GitHub token or complete GitHub App configuration required")
         async with self._lock:
             if self._cached and self._cached[1] > datetime.now(timezone.utc) + timedelta(minutes=5):
                 return self._cached[0]

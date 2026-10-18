@@ -58,7 +58,7 @@ def eligibility(db: Session, ticket: Ticket, pr: dict, checks: list[dict], paths
 
 class GitHubMergeClient:
     def __init__(self, token: str | None = None, transport=None):
-        self.token = settings.github_token if token is None else token
+        self.token = token
         self.transport = transport
 
     async def _get_pages(self, client, path):
@@ -77,7 +77,7 @@ class GitHubMergeClient:
     async def reconcile(self, db: Session, ticket: Ticket) -> dict:
         if not ticket.pr_number:
             return {"merged": False, "reasons": ["PR missing"]}
-        token = self.token or await tokens.get()
+        token = await tokens.get(self.token)
         repo = ticket.repository.full_name
         number = ticket.pr_number
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10"}

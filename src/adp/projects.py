@@ -11,7 +11,7 @@ class GitHubProjectsClient:
         self.transport = transport
 
     async def _query(self, query: str, variables: dict) -> dict:
-        token = self.token or await tokens.get()
+        token = await tokens.get(self.token)
         async with httpx.AsyncClient(base_url=settings.github_api_url, transport=self.transport, timeout=30) as client:
             response = await client.post("/graphql", headers={"Authorization": f"Bearer {token}"}, json={"query": query, "variables": variables})
             response.raise_for_status()

@@ -535,7 +535,7 @@ async def reconcile_merges(db: Session = Depends(db_session)):
         if submitted or (ticket.repository.auto_merge and not ticket.repository.paused and not (global_state and global_state.paused)):
             try:
                 results[ticket.id] = await GitHubMergeClient().reconcile(db, ticket)
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, RuntimeError) as exc:
                 results[ticket.id] = {"merged": False, "reasons": [f"GitHub error: {type(exc).__name__}"]}
     return results
 

@@ -117,4 +117,6 @@ fi
 if [[ "$mode" == "--control-only" ]]; then exit 0; fi
 
 echo "Starting host worker in this terminal. Press Ctrl-C once to yield its active job safely."
+# The control credential and local control-plane GitHub token are not worker credentials.
+unset CONTROL_TOKEN GITHUB_TOKEN GITHUB_APP_ID GITHUB_INSTALLATION_ID GITHUB_PRIVATE_KEY_PATH GITHUB_APP_PRIVATE_KEY_FILE GITHUB_WEBHOOK_SECRET
 exec "$adp" worker --config "$config"

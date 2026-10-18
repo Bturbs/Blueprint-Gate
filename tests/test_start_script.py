@@ -21,7 +21,11 @@ set -euo pipefail
 case "$1" in
   control-status) [[ "${CONTROL_TOKEN:-}" == admin-secret ]]; printf '{"paused":%s}\\n' "$(cat "$TEST_STATUS")" ;;
   resume) [[ "${CONTROL_TOKEN:-}" == admin-secret ]]; echo false > "$TEST_STATUS"; echo resume >> "$TEST_LOG" ;;
-  worker) [[ "${ADP_WORKER_TOKEN:-}" == worker-secret ]]; echo worker >> "$TEST_LOG" ;;
+  worker)
+    [[ "${ADP_WORKER_TOKEN:-}" == worker-secret ]]
+    [[ -z "${CONTROL_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" && -z "${GITHUB_APP_ID:-}" ]]
+    [[ -z "${GITHUB_INSTALLATION_ID:-}" && -z "${GITHUB_PRIVATE_KEY_PATH:-}" && -z "${GITHUB_WEBHOOK_SECRET:-}" ]]
+    echo worker >> "$TEST_LOG" ;;
 esac
 """)
     (root / ".venv" / "bin" / "adp").chmod(0o755)
@@ -72,8 +76,7 @@ def test_worker_only_does_not_require_local_docker_or_database(tmp_path):
     (root / ".env").unlink()
     status = root / "status"
     status.write_text("false")
-    env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}", TEST_STATUS=str(status), TEST_LOG=str(root / "calls"), ADP_WORKER_TOKEN="worker-secret")
-    env.pop("CONTROL_TOKEN", None)
+    env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}", TEST_STATUS=str(status), TEST_LOG=str(root / "calls"), ADP_WORKER_TOKEN="worker-secret", CONTROL_TOKEN="admin-secret", GITHUB_TOKEN="control-github-token", GITHUB_APP_ID="123", GITHUB_INSTALLATION_ID="456", GITHUB_PRIVATE_KEY_PATH="/tmp/app.pem", GITHUB_WEBHOOK_SECRET="webhook-secret")
     result = subprocess.run([str(script), "--worker-only"], cwd=root, env=env, text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert (root / "calls").read_text().splitlines() == ["worker"]
